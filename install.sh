@@ -7,10 +7,17 @@ set -eu
 REPO="${WIGGLE3D_REPO:-DeokhoKim/wiggle-3d}"
 INSTALL_DIR="${WIGGLE3D_INSTALL_DIR:-$HOME/.local/bin}"
 LIB_DIR="${WIGGLE3D_LIB_DIR:-$(dirname "$INSTALL_DIR")/lib}"
+STATE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/reto3d"
+ORT_MANIFEST="${STATE_DIR}/onnxruntime_files.txt"
 VERSION="${WIGGLE3D_VERSION:-latest}"
 
 # Standardized ANSI Logging
 NC='\033[0m'
+
+log_debug() {
+    local cyan='\033[0;36m'
+    printf "%b[DEBUG]%b %s\n" "$cyan" "$NC" "$1"
+}
 
 log_info() {
     local green='\033[0;32m'
@@ -39,13 +46,21 @@ case "$ACTION" in
             log_warn "Binary ${INSTALL_DIR}/reto-cli was not found."
         fi
 
-        rm -f "${LIB_DIR}"/libonnxruntime* 2>/dev/null || true
-        rm -f "${INSTALL_DIR}"/libonnxruntime* 2>/dev/null || true
+        # Remove ONNX Runtime shared libraries only if provisioned by this script
+        if [ -f "$ORT_MANIFEST" ]; then
+            xargs rm -f < "$ORT_MANIFEST" 2>/dev/null || true
+            rm -f "$ORT_MANIFEST"
+            log_info "Removed installer-provisioned ONNX Runtime libraries from ${LIB_DIR}"
+        fi
 
         CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/reto3d"
         if [ -d "$CACHE_DIR" ]; then
             rm -rf "$CACHE_DIR"
             log_info "Cleaned model cache: ${CACHE_DIR}"
+        fi
+
+        if [ -d "$STATE_DIR" ]; then
+            rm -rf "$STATE_DIR"
         fi
 
         log_info "Wiggle-3D has been successfully uninstalled."
@@ -240,14 +255,24 @@ if ! "${INSTALL_DIR}/reto-cli" --help >/dev/null 2>&1; then
         ORT_TMP="${TMP_DIR}/ort"
         mkdir -p "$ORT_TMP"
         mkdir -p "$LIB_DIR"
+        mkdir -p "$STATE_DIR"
         if curl -fSL --progress-bar "$ORT_DOWNLOAD_URL" -o "${TMP_DIR}/${ORT_TAR}"; then
             tar -xzf "${TMP_DIR}/${ORT_TAR}" -C "$ORT_TMP"
+            : > "$ORT_MANIFEST"
             case "$OS" in
                 Linux)
-                    cp -P "${ORT_TMP}"/onnxruntime-*/lib/libonnxruntime* "${LIB_DIR}/"
+                    for f in "${ORT_TMP}"/onnxruntime-*/lib/libonnxruntime*; do
+                        base_name="$(basename "$f")"
+                        cp -P "$f" "${LIB_DIR}/"
+                        echo "${LIB_DIR}/${base_name}" >> "$ORT_MANIFEST"
+                    done
                     ;;
                 Darwin)
-                    cp -P "${ORT_TMP}"/onnxruntime-*/lib/libonnxruntime*.dylib "${LIB_DIR}/"
+                    for f in "${ORT_TMP}"/onnxruntime-*/lib/libonnxruntime*.dylib; do
+                        base_name="$(basename "$f")"
+                        cp -P "$f" "${LIB_DIR}/"
+                        echo "${LIB_DIR}/${base_name}" >> "$ORT_MANIFEST"
+                    done
                     ;;
             esac
             log_info "Successfully installed ONNX Runtime libraries to ${LIB_DIR}."
