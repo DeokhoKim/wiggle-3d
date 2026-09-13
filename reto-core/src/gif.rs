@@ -22,6 +22,11 @@ pub const DEFAULT_NEUQUANT_SAMPLE_FAC: i32 = 10;
 pub const DEFAULT_PALETTE_COLORS: usize = 256;
 
 /// Configuration for Wiggle 3D GIF generation.
+///
+/// # TODO (Motion Interpolation & Easing Curve Playback)
+/// Linear ping-pong frame delays (e.g. 100ms) can appear rigid at motion turnaround points.
+/// Support non-linear timing curves (ease-in / ease-out) at direction inflection points (Frames 0 and 2)
+/// or intermediate frame blending/morphing (optical flow frame interpolation) for ultra-smooth 60 fps playback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WiggleGifConfig {
     /// Inter-frame delay in milliseconds.
@@ -183,7 +188,149 @@ impl DisparityHistogramData {
     }
 }
 
+/// Disparity histogram binning and depth surface clustering result.
+#[derive(Debug)]
+struct HistogramClusteringResult {
+    bin_map: std::collections::BTreeMap<i32, Vec<usize>>,
+    populated_bins: Vec<i32>,
+    clusters: Vec<Vec<i32>>,
+    target_cluster_idx: usize,
+}
+
+impl HistogramClusteringResult {
+    fn compute<T, F>(
+        items: &[T],
+        get_inv_disp: F,
+        effective_bin_size: f32,
+        effective_tolerance: f32,
+    ) -> Option<Self>
+    where
+        F: Fn(&T) -> f32,
+    {
+        if items.is_empty() {
+            return None;
+        }
+
+        let mut bin_map: std::collections::BTreeMap<i32, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for (idx, item) in items.iter().enumerate() {
+            let bin_idx = (get_inv_disp(item) / effective_bin_size).floor() as i32;
+            bin_map.entry(bin_idx).or_default().push(idx);
+        }
+
+        let populated_bins: Vec<i32> = bin_map.keys().copied().collect();
+        if populated_bins.is_empty() {
+            return None;
+        }
+
+        let clusters = if effective_tolerance <= 0.0 {
+            populated_bins.iter().map(|&b| vec![b]).collect()
+        } else {
+            let max_bin_gap = (effective_tolerance / effective_bin_size).ceil().max(1.0) as i32;
+            let mut clusters: Vec<Vec<i32>> = Vec::new();
+            let mut current_cluster: Vec<i32> = Vec::new();
+
+            for &b in &populated_bins {
+                if let Some(&last_b) = current_cluster.last() {
+                    if (b - last_b).abs() <= max_bin_gap {
+                        current_cluster.push(b);
+                    } else {
+                        clusters.push(std::mem::replace(&mut current_cluster, vec![b]));
+                    }
+                } else {
+                    current_cluster.push(b);
+                }
+            }
+            if !current_cluster.is_empty() {
+                clusters.push(current_cluster);
+            }
+            clusters
+        };
+
+        let total_pts = items.len();
+        let min_points_threshold = ((total_pts as f32) * DEFAULT_FOREGROUND_MIN_PROPORTION)
+            .ceil()
+            .max(1.0) as usize;
+
+        let first_foreground_bin = populated_bins
+            .iter()
+            .copied()
+            .find(|b| bin_map.get(b).map_or(0, |v| v.len()) >= min_points_threshold);
+
+        let target_bin = first_foreground_bin.map(|b_0| {
+            let mut best_bin = b_0;
+            let mut best_count = bin_map.get(&b_0).map_or(0, |v| v.len());
+            let mut curr_bin = b_0;
+
+            loop {
+                let next_bin = curr_bin + 1;
+                let next_count = bin_map.get(&next_bin).map_or(0, |v| v.len());
+                if next_count == 0 {
+                    break;
+                }
+                if next_count >= best_count {
+                    best_bin = next_bin;
+                    best_count = next_count;
+                    curr_bin = next_bin;
+                } else {
+                    break;
+                }
+            }
+            best_bin
+        });
+
+        let target_cluster_idx = if clusters.len() == 1 {
+            0
+        } else if let Some(bin) = target_bin {
+            clusters
+                .iter()
+                .enumerate()
+                .find(|(_, c)| c.contains(&bin))
+                .map_or_else(
+                    || {
+                        clusters
+                            .iter()
+                            .enumerate()
+                            .max_by_key(|(_, c)| {
+                                c.iter()
+                                    .filter_map(|b| bin_map.get(b))
+                                    .map(|v| v.len())
+                                    .sum::<usize>()
+                            })
+                            .map_or(0, |(i, _)| i)
+                    },
+                    |(i, _)| i,
+                )
+        } else {
+            clusters
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, c)| {
+                    c.iter()
+                        .filter_map(|b| bin_map.get(b))
+                        .map(|v| v.len())
+                        .sum::<usize>()
+                })
+                .map_or(0, |(i, _)| i)
+        };
+
+        Some(Self {
+            bin_map,
+            populated_bins,
+            clusters,
+            target_cluster_idx,
+        })
+    }
+}
+
 /// Aligns sub-frames to an anchor frame based on depth surface correspondence shifts.
+///
+/// # TODO (3D Camera Extrinsics & Epipolar Rectification)
+/// Planar 2D translation shifts align focal depth surfaces but do not model out-of-plane
+/// camera rotations (pitch/yaw/roll) between physical lenses.
+/// Decompose fundamental/essential matrices ($E = [\mathbf{t}]_\times R$) to compute true rigid
+/// relative extrinsics ($R_{01}, \mathbf{t}_{01}, R_{12}, \mathbf{t}_{12}$) and apply rectification
+/// homographies ($R_{\text{rect}}$) to align epipolar lines strictly horizontally across views.
 pub struct WiggleAligner;
 
 impl WiggleAligner {
@@ -422,119 +569,21 @@ impl WiggleAligner {
             }
         }
 
-        if data.is_empty() {
-            return ([(0.0, 0.0), (0.0, 0.0), (0.0, 0.0)], empty_debug);
-        }
-
-        // 1. Group triplet indices into histogram bins based on inverse disparity (1/d)
-        let mut bin_map: std::collections::BTreeMap<i32, Vec<usize>> =
-            std::collections::BTreeMap::new();
-        for (idx, item) in data.iter().enumerate() {
-            let bin_idx = (item.inv_disp / effective_bin_size).floor() as i32;
-            bin_map.entry(bin_idx).or_default().push(idx);
-        }
-
-        let populated_bins: Vec<i32> = bin_map.keys().copied().collect();
-        if populated_bins.is_empty() {
-            return ([(0.0, 0.0), (0.0, 0.0), (0.0, 0.0)], empty_debug);
-        }
-
-        // 2. Cluster populated bins into depth surfaces (if tolerance <= 0.0, each bin is its own surface/cluster)
-        let clusters: Vec<Vec<i32>> = if effective_tolerance <= 0.0 {
-            populated_bins.iter().map(|&b| vec![b]).collect()
-        } else {
-            let max_bin_gap = (effective_tolerance / effective_bin_size).ceil().max(1.0) as i32;
-            let mut clusters: Vec<Vec<i32>> = Vec::new();
-            let mut current_cluster: Vec<i32> = Vec::new();
-
-            for &b in &populated_bins {
-                if let Some(&last_b) = current_cluster.last() {
-                    if (b - last_b).abs() <= max_bin_gap {
-                        current_cluster.push(b);
-                    } else {
-                        clusters.push(std::mem::replace(&mut current_cluster, vec![b]));
-                    }
-                } else {
-                    current_cluster.push(b);
-                }
-            }
-            if !current_cluster.is_empty() {
-                clusters.push(current_cluster);
-            }
-            clusters
+        let clustering = match HistogramClusteringResult::compute(
+            &data,
+            |item| item.inv_disp,
+            effective_bin_size,
+            effective_tolerance,
+        ) {
+            Some(res) => res,
+            None => return ([(0.0, 0.0), (0.0, 0.0), (0.0, 0.0)], empty_debug),
         };
 
-        // 4. Select the depth surface cluster / top-most bin within foreground group:
-        // In 1/d space: smaller 1/d corresponds to larger disparity d (closer foreground subject).
-        let total_pts = data.len();
-        let min_points_threshold = ((total_pts as f32) * DEFAULT_FOREGROUND_MIN_PROPORTION)
-            .ceil()
-            .max(1.0) as usize;
-
-        // Find the first bin exceeding the 1% threshold
-        let first_foreground_bin = populated_bins
-            .iter()
-            .copied()
-            .find(|b| bin_map.get(b).map_or(0, |v| v.len()) >= min_points_threshold);
-
-        let target_bin = first_foreground_bin.map(|b_0| {
-            let mut best_bin = b_0;
-            let mut best_count = bin_map.get(&b_0).map_or(0, |v| v.len());
-            let mut curr_bin = b_0;
-
-            loop {
-                let next_bin = curr_bin + 1;
-                let next_count = bin_map.get(&next_bin).map_or(0, |v| v.len());
-                if next_count == 0 {
-                    // Faced 0-valued bin / gap -> group ended
-                    break;
-                }
-                if next_count >= best_count {
-                    // Monotonically increasing -> advance peak
-                    best_bin = next_bin;
-                    best_count = next_count;
-                    curr_bin = next_bin;
-                } else {
-                    // Dropping -> peak reached
-                    break;
-                }
-            }
-            best_bin
-        });
-
-        let (target_cluster_idx, target_cluster) = if clusters.len() == 1 {
-            (0, &clusters[0])
-        } else if let Some(bin) = target_bin {
-            clusters
-                .iter()
-                .enumerate()
-                .find(|(_, c)| c.contains(&bin))
-                .unwrap_or_else(|| {
-                    let max_idx = clusters
-                        .iter()
-                        .enumerate()
-                        .max_by_key(|(_, c)| {
-                            c.iter()
-                                .filter_map(|b| bin_map.get(b))
-                                .map(|v| v.len())
-                                .sum::<usize>()
-                        })
-                        .map_or(0, |(i, _)| i);
-                    (max_idx, &clusters[max_idx])
-                })
-        } else {
-            let max_idx = clusters
-                .iter()
-                .enumerate()
-                .max_by_key(|(_, c)| {
-                    c.iter()
-                        .filter_map(|b| bin_map.get(b))
-                        .map(|v| v.len())
-                        .sum::<usize>()
-                })
-                .map_or(0, |(i, _)| i);
-            (max_idx, &clusters[max_idx])
-        };
+        let bin_map = clustering.bin_map;
+        let populated_bins = clustering.populated_bins;
+        let clusters = clustering.clusters;
+        let target_cluster_idx = clustering.target_cluster_idx;
+        let target_cluster = &clusters[target_cluster_idx];
 
         // 5. Gather all triplet indices in the selected depth surface cluster
         let mut cluster_triplet_indices = Vec::new();
@@ -782,101 +831,18 @@ impl WiggleAligner {
                 }
             }
 
-            if list.is_empty() {
-                return (0.0, 0.0);
-            }
-
-            let mut bin_map: std::collections::BTreeMap<i32, Vec<usize>> =
-                std::collections::BTreeMap::new();
-            for (idx, item) in list.iter().enumerate() {
-                let bin_idx = (item.inv_disp / effective_bin_size).floor() as i32;
-                bin_map.entry(bin_idx).or_default().push(idx);
-            }
-
-            let populated_bins: Vec<i32> = bin_map.keys().copied().collect();
-            if populated_bins.is_empty() {
-                return (0.0, 0.0);
-            }
-
-            let max_bin_gap = (effective_tolerance / effective_bin_size).ceil().max(1.0) as i32;
-            let mut clusters: Vec<Vec<i32>> = Vec::new();
-            let mut current_cluster: Vec<i32> = Vec::new();
-
-            for &b in &populated_bins {
-                if let Some(&last_b) = current_cluster.last() {
-                    if (b - last_b).abs() <= max_bin_gap {
-                        current_cluster.push(b);
-                    } else {
-                        clusters.push(std::mem::replace(&mut current_cluster, vec![b]));
-                    }
-                } else {
-                    current_cluster.push(b);
-                }
-            }
-            if !current_cluster.is_empty() {
-                clusters.push(current_cluster);
-            }
-
-            let total_pts = list.len();
-            let min_points_threshold = ((total_pts as f32) * DEFAULT_FOREGROUND_MIN_PROPORTION)
-                .ceil()
-                .max(1.0) as usize;
-
-            let first_foreground_bin = populated_bins
-                .iter()
-                .copied()
-                .find(|b| bin_map.get(b).map_or(0, |v| v.len()) >= min_points_threshold);
-
-            let target_bin = first_foreground_bin.map(|b_0| {
-                let mut best_bin = b_0;
-                let mut best_count = bin_map.get(&b_0).map_or(0, |v| v.len());
-                let mut curr_bin = b_0;
-
-                loop {
-                    let next_bin = curr_bin + 1;
-                    let next_count = bin_map.get(&next_bin).map_or(0, |v| v.len());
-                    if next_count == 0 {
-                        break;
-                    }
-                    if next_count >= best_count {
-                        best_bin = next_bin;
-                        best_count = next_count;
-                        curr_bin = next_bin;
-                    } else {
-                        break;
-                    }
-                }
-                best_bin
-            });
-
-            let target_cluster = if clusters.len() == 1 {
-                &clusters[0]
-            } else if let Some(bin) = target_bin {
-                clusters
-                    .iter()
-                    .find(|c| c.contains(&bin))
-                    .unwrap_or_else(|| {
-                        clusters
-                            .iter()
-                            .max_by_key(|c| {
-                                c.iter()
-                                    .filter_map(|b| bin_map.get(b))
-                                    .map(|v| v.len())
-                                    .sum::<usize>()
-                            })
-                            .unwrap_or(&populated_bins)
-                    })
-            } else {
-                clusters
-                    .iter()
-                    .max_by_key(|c| {
-                        c.iter()
-                            .filter_map(|b| bin_map.get(b))
-                            .map(|v| v.len())
-                            .sum::<usize>()
-                    })
-                    .unwrap_or(&populated_bins)
+            let clustering = match HistogramClusteringResult::compute(
+                &list,
+                |item| item.inv_disp,
+                effective_bin_size,
+                effective_tolerance,
+            ) {
+                Some(res) => res,
+                None => return (0.0, 0.0),
             };
+
+            let bin_map = clustering.bin_map;
+            let target_cluster = &clustering.clusters[clustering.target_cluster_idx];
 
             let mut cluster_indices = Vec::new();
             for &b in target_cluster {
@@ -990,13 +956,7 @@ impl WiggleAligner {
             let local_src_x = (min_x - dx).max(0) as u32;
             let local_src_y = (min_y - dy).max(0) as u32;
 
-            let mut crop = RgbaImage::new(crop_w, crop_h);
-            for y in 0..crop_h {
-                for x in 0..crop_w {
-                    let p = frame.get_pixel(local_src_x + x, local_src_y + y);
-                    crop.put_pixel(x, y, *p);
-                }
-            }
+            let crop = image::imageops::crop_imm(frame, local_src_x, local_src_y, crop_w, crop_h).to_image();
             aligned_crops.push(crop);
         }
 
@@ -1042,6 +1002,12 @@ impl ColorMap for NeuQuantColorMap {
 }
 
 /// Wiggle 3D GIF builder with global multi-frame palette quantization and dithering.
+///
+/// # TODO (Modern Video Container & Codec Support)
+/// GIF format is constrained to an 8-bit indexed palette (256 colors) and large file sizes.
+/// Add native video export targets: MP4 (H.264 / H.265 / AV1) and WebM (VP9 / AV1) with full 24-bit
+/// RGB/RGBA true color depth and significantly reduced file sizes, as well as Animated PNG (APNG)
+/// for lossless 24-bit animated web presentation without color quantization artifacts.
 pub struct WiggleGifBuilder;
 
 impl WiggleGifBuilder {

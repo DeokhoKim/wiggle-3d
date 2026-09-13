@@ -48,23 +48,32 @@ impl AxisPixelStats {
     /// assert_eq!(stats.avg, 30.0);
     /// ```
     #[must_use]
+    #[inline]
+    pub fn from_samples(samples: &[u8]) -> Self {
+        Self::from_iter(samples.iter().copied(), samples.len() as u32)
+    }
+
+    /// Constructs statistics from an arbitrary iterator of byte samples.
+    ///
+    /// Computes summary statistics in a single pass without heap allocating sample vectors.
+    #[must_use]
     #[allow(
         clippy::cast_precision_loss,
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         clippy::suboptimal_flops
     )]
-    pub fn from_samples(samples: &[u8]) -> Self {
-        assert!(!samples.is_empty(), "Samples slice cannot be empty");
+    pub fn from_iter<I: Iterator<Item = u8>>(iter: I, total_count: u32) -> Self {
+        assert!(total_count > 0, "Samples count cannot be zero");
 
-        let n = samples.len() as f32;
+        let n = total_count as f32;
         let mut min_val = u8::MAX;
         let mut max_val = u8::MIN;
         let mut sum = 0_u64;
         let mut sum_sq = 0_u64;
         let mut hist = [0_u32; 256];
 
-        for &val in samples {
+        for val in iter {
             if val < min_val {
                 min_val = val;
             }
@@ -82,9 +91,9 @@ impl AxisPixelStats {
         let std = if variance > 0.0 { variance.sqrt() } else { 0.0 };
 
         // 5th percentile rank and 98th percentile rank
-        let p5_target = ((n * DEFAULT_LOW_PERCENTILE).round() as u32).min(samples.len() as u32 - 1);
+        let p5_target = ((n * DEFAULT_LOW_PERCENTILE).round() as u32).min(total_count - 1);
         let p98_target =
-            ((n * DEFAULT_HIGH_PERCENTILE).round() as u32).min(samples.len() as u32 - 1);
+            ((n * DEFAULT_HIGH_PERCENTILE).round() as u32).min(total_count - 1);
 
         let mut cum = 0_u32;
         let mut p5 = min_val;
@@ -114,29 +123,26 @@ impl AxisPixelStats {
     }
 }
 
-/// 1D array of cross-axis statistics computed for every pixel position along the major stacking axis.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Aggregated strip profiles evaluated across scanline cross-sections.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AxisStatisticsProfile {
-    /// Per-pixel statistics along the major stacking axis of length `major_len`.
+    /// Ordered sequence of cross-sectional statistics computed for each position on the primary axis.
     pub stats: Vec<AxisPixelStats>,
-    /// Total number of sampled cross-axis pixels per position (`minor_len`).
+    /// Number of cross-axis sample pixels integrated into each statistics slice.
     pub sample_count: u32,
-    /// Orientation of the film strip scan.
+    /// Orientation of the analyzed film strip.
     pub orientation: StripOrientation,
 }
 
 impl AxisStatisticsProfile {
-    /// Computes the complete 1D axis statistics profile from a `ScaledGrayscaleStrip`.
-    ///
-    /// Automatically applies orientation delegation (column-wise for Horizontal, row-wise for Vertical)
-    /// and parallelizes computation across all CPU cores via Rayon.
+    /// Computes the cross-sectional statistical profile of a scaled luma image along its primary stacking axis.
     ///
     /// # Arguments
-    /// * `luma` - Scaled luma image.
+    /// * `luma` - The scaled grayscale image to profile.
     ///
     /// # Examples
     /// ```
-    /// use reto_core::{Bt709LumaConverter, ScaledLumaImage, AxisStatisticsProfile, PROJECTION_MAX_DIMENSION};
+    /// use reto_core::{AxisStatisticsProfile, ScaledLumaImage, Bt709LumaConverter, PROJECTION_MAX_DIMENSION};
     /// use image::{Rgba, RgbaImage};
     ///
     /// let img = RgbaImage::from_pixel(300, 100, Rgba([120, 120, 120, 255]));
@@ -153,11 +159,8 @@ impl AxisStatisticsProfile {
         let stats: Vec<AxisPixelStats> = (0..major_len)
             .into_par_iter()
             .map(|major| {
-                let mut samples = Vec::with_capacity(minor_len as usize);
-                for cross in 0..minor_len {
-                    samples.push(luma.get(major, cross));
-                }
-                AxisPixelStats::from_samples(&samples)
+                let iter = (0..minor_len).map(|cross| luma.get(major, cross));
+                AxisPixelStats::from_iter(iter, minor_len)
             })
             .collect();
 
@@ -406,11 +409,13 @@ impl AxisStatisticsProfile {
 
         let diffs: Vec<u8> = self.p98_minus_p5_series();
 
-        let mut sorted_diffs = diffs.clone();
-        sorted_diffs.sort_unstable();
-        let min_d = sorted_diffs[0];
-        let max_d = sorted_diffs[(l * 4) / 5]; // 80th percentile
-        let median_d = f32::from(sorted_diffs[l / 2]);
+        let mut sample_diffs = diffs.clone();
+        let min_d = *sample_diffs.iter().min().unwrap_or(&0);
+        let mid_idx = l / 2;
+        let (_, &mut median_val, _) = sample_diffs.select_nth_unstable(mid_idx);
+        let median_d = f32::from(median_val);
+        let p80_idx = (l * 4) / 5;
+        let (_, &mut max_d, _) = sample_diffs.select_nth_unstable(p80_idx);
 
         let check_threshold = |t: u8| -> Option<Vec<(bool, usize, usize)>> {
             let mut runs = Vec::new();

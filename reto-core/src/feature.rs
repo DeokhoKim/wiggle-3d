@@ -701,6 +701,15 @@ pub struct FeatureTriplet {
 }
 
 /// Boundary condition configuration for rigid chassis cascaded transform and depth consistency.
+///
+/// # TODO (Lens Distortion Modeling)
+/// Uncalibrated optical distortion from low-cost multi-lens plastic toy cameras (such as RETO 3D,
+/// Nimslo, Nishika) causes non-linear peripheral curvature mismatch near outer boundaries.
+/// When multi-view reprojection residual errors across outer frame boundaries exceed `0.5 px`,
+/// incorporate per-lens radial ($k_1, k_2$) and tangential ($p_1, p_2$) distortion parameters
+/// into joint bundle adjustment self-calibration:
+/// - $x_d = x(1 + k_1 r^2 + k_2 r^4) + 2 p_1 x y + p_2(r^2 + 2 x^2)$
+/// - $y_d = y(1 + k_1 r^2 + k_2 r^4) + p_1(r^2 + 2 y^2) + 2 p_2 x y$
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct TripletConsistencyConfig {
     /// Nominal baseline ratio $B_{01} / B_{12}$ (1.0 for symmetric baseline).
@@ -1948,6 +1957,15 @@ impl PointDetector for SuperPointDetector {
         clippy::too_many_lines
     )]
     #[tracing::instrument(skip(self, luma, rois, tap), level = "debug")]
+    /// Detects keypoints and descriptors for multiple frame ROIs within a single luma image.
+    ///
+    /// # TODO (High-Resolution Sub-Pixel Patch Refinement)
+    /// Keypoints extracted on downscaled luma images rely on coarse grid response interpolation
+    /// when unmapped to original scan resolution ($W_{\text{orig}} \times H_{\text{orig}}$).
+    /// When epipolar reprojection residuals or focal anchor jitter require sub-0.2 px precision
+    /// on large high-res scans, sample full-resolution patches ($15 \times 15\text{ px}$) around
+    /// projected keypoints and apply localized quadratic peak interpolation (2D Taylor polynomial)
+    /// or Lucas-Kanade gradient-based photometric patch tracking.
     fn detect_luma_all(
         &self,
         luma: &ScaledLumaImage,
@@ -2020,19 +2038,6 @@ impl PointDetector for SuperPointDetector {
 
         let n_frames = specs.len();
         let delegator = luma.orientation.delegator();
-        let canvas_stride = (MODEL_CANVAS_HEIGHT * MODEL_CANVAS_WIDTH) as usize;
-        let mut batch_luma = vec![0.0_f32; n_frames * canvas_stride];
-
-        for (b_idx, spec) in specs.iter().enumerate() {
-            let dst_slice = &mut batch_luma[b_idx * canvas_stride..(b_idx + 1) * canvas_stride];
-            delegator.fill_inference_canvas(
-                dst_slice,
-                MODEL_CANVAS_WIDTH,
-                &spec.scaled_img,
-                spec.scaled_w,
-                spec.scaled_h,
-            );
-        }
 
         let mut batched_results: Option<Vec<Vec<KeyPoint>>> = None;
         let model_shared = self.get_or_init_model();

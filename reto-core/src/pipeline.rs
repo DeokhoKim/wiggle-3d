@@ -11,7 +11,6 @@ use crate::geom::FrameRoiSet;
 use crate::luma::{Bt709LumaConverter, ScaledLumaImage, PROJECTION_MAX_DIMENSION};
 use crate::visualizer::RoiVisualizer;
 use image::{DynamicImage, Rgba};
-use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 
 /// Default supported input image file extensions for Reto-Split batch scanning.
@@ -370,36 +369,6 @@ pub enum ItemProcessingOutcome {
     Failure,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct ItemProcessingCounts {
-    successful_count: usize,
-    failed_count: usize,
-}
-
-impl ItemProcessingCounts {
-    #[must_use]
-    const fn from_outcome(outcome: ItemProcessingOutcome) -> Self {
-        match outcome {
-            ItemProcessingOutcome::Success => Self {
-                successful_count: 1,
-                failed_count: 0,
-            },
-            ItemProcessingOutcome::Failure => Self {
-                successful_count: 0,
-                failed_count: 1,
-            },
-        }
-    }
-
-    #[must_use]
-    const fn combine(self, other: Self) -> Self {
-        Self {
-            successful_count: self.successful_count + other.successful_count,
-            failed_count: self.failed_count + other.failed_count,
-        }
-    }
-}
-
 /// Execution summary of batch processing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ProcessSummary {
@@ -473,40 +442,21 @@ fn render_roi_overlay(
 
 #[allow(clippy::type_complexity)]
 #[tracing::instrument(level = "debug", skip_all)]
-fn extract_features(
+fn match_features(
     file_stem: &str,
-    luma: &ScaledLumaImage,
+    features: &[crate::feature::FeatureFrame],
+    orientation: crate::geom::StripOrientation,
     rois: &FrameRoiSet,
     overlay_path: Option<PathBuf>,
     roi_overlay: Option<DynamicImage>,
-    device: crate::feature::BackendDevice,
     frame_faces: &[crate::visualizer::FrameFaceRecord],
 ) -> Result<(
-    Vec<crate::feature::FeatureFrame>,
     Vec<crate::feature::FeatureTriplet>,
     Vec<(crate::feature::FramePair, Vec<crate::feature::FeatureMatch>)>,
 )> {
     use crate::feature::{
-        FeatureMatcher, PointDetector, SuperPointConfig, SuperPointDescriptorMatcher,
-        SuperPointDetector, TripletConsistencyConfig,
+        FeatureMatcher, SuperPointDescriptorMatcher, TripletConsistencyConfig,
     };
-
-    let config = SuperPointConfig {
-        device,
-        ..Default::default()
-    };
-    let point_detector = SuperPointDetector::new(config);
-    let features = point_detector.detect_luma_all(luma, &rois.frames, None)?;
-
-    let counts: Vec<usize> = features
-        .iter()
-        .map(crate::feature::FeatureFrame::len)
-        .collect();
-    tracing::info!(
-        file = %file_stem,
-        keypoints = ?counts,
-        "Detected frame keypoints"
-    );
 
     let mut extracted_triplets = Vec::new();
     let mut extracted_pairs = Vec::new();
@@ -514,7 +464,7 @@ fn extract_features(
     // If at least 2 frames exist, match across frames
     if features.len() >= 2 {
         let matcher = SuperPointDescriptorMatcher::default();
-        let consistency_config = TripletConsistencyConfig::with_orientation(luma.orientation);
+        let consistency_config = TripletConsistencyConfig::with_orientation(orientation);
 
         let tap = match (overlay_path, roi_overlay) {
             (Some(path), Some(overlay)) => {
@@ -535,7 +485,7 @@ fn extract_features(
 
         if features.len() >= 3 {
             match matcher.extract_consistent_triplets(
-                &features,
+                features,
                 &consistency_config,
                 tap.as_ref().map(|t| t as &dyn AlignmentDiagnosticTap),
             ) {
@@ -576,65 +526,129 @@ fn extract_features(
         feat_tap.finish()?;
     }
 
-    Ok((features, extracted_triplets, extracted_pairs))
+    Ok((extracted_triplets, extracted_pairs))
 }
 
-/// Processes a single image item context through detection, visualization, and feature extraction.
-///
-/// # Arguments
-/// * `item` - The image item context to process.
-/// * `config` - Detection parameters.
-///
-/// # Errors
-/// Returns [`Error`] if image loading, `RoI` detection, or feature extraction fails.
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::option_if_let_else,
-    clippy::too_many_lines
-)]
-#[tracing::instrument(level = "debug", skip_all)]
-pub fn process_item(
+/// Intermediate payload produced by Stage 1 (image loading, scaling, RoI detection, and sub-frame extraction).
+struct VisionStagePayload {
+    item: ImageItemContext,
+    file_stem: String,
+    output_dir: PathBuf,
+    device: crate::feature::BackendDevice,
+    dynamic_img: DynamicImage,
+    luma_image: ScaledLumaImage,
+    rois: FrameRoiSet,
+    sub_frame_crops: Vec<DynamicImage>,
+    overlay_path: Option<PathBuf>,
+    roi_overlay: Option<DynamicImage>,
+}
+
+/// Intermediate payload produced by Stage 2 (parallel neural inference, feature matching, and alignment cropping).
+struct AlignedStagePayload {
+    item: ImageItemContext,
+    file_stem: String,
+    output_dir: PathBuf,
+    dynamic_img: DynamicImage,
+    rois: FrameRoiSet,
+    aligned_frames: Option<Vec<image::RgbaImage>>,
+}
+
+/// Intermediate payload produced by Stage 3 (NeuQuant color quantization and GIF byte serialization).
+struct EncodedStagePayload {
+    item: ImageItemContext,
+    gif_output: Option<(PathBuf, Vec<u8>)>,
+}
+
+/// Stage 1: Ingestion, format decoding, scaled luma generation, and RoI detection.
+fn stage_decode_and_roi(
     mut item: ImageItemContext,
     config: &RoiDetectionConfig,
-) -> Result<ImageItemContext> {
-    let source_path = item.source_path().to_path_buf();
+) -> Result<VisionStagePayload> {
     let file_stem = item.file_stem().to_string();
     let output_dir = item.output_dir().to_path_buf();
+    let device = item.device();
 
     let dynamic_img = load_image(&mut item)?;
-
     let luma_image = prepare_luma(&dynamic_img)?;
     let rois = detect_rois(&luma_image, config, None)?;
-    item.set_luma_image(luma_image);
 
-    // Extract sub-frame crops for face detection and Wiggle GIF assembly
     let sub_frame_crops = RoiVisualizer::extract_frame_images(&dynamic_img, &rois)?;
 
-    // Detect faces across each extracted sub-frame crop (batch of individual frames)
-    let mut frame_faces = Vec::new();
-    if !sub_frame_crops.is_empty() {
-        match RetinaFaceDetector::default_engine() {
-            Ok(face_detector) => match face_detector.detect_faces_for_rois(&sub_frame_crops) {
-                Ok(records) => {
-                    let total_faces: usize = records.iter().map(|(_, list, _)| list.len()).sum();
-                    if total_faces > 0 {
-                        tracing::debug!(
-                            file = %file_stem,
-                            faces = total_faces,
-                            "Detected faces across sub-frames"
-                        );
+    let (overlay_path, roi_overlay) = if item.debug() {
+        let (path, overlay) = render_roi_overlay(&dynamic_img, &rois, &output_dir, &file_stem);
+        (Some(path), Some(overlay))
+    } else {
+        (None, None)
+    };
+
+    Ok(VisionStagePayload {
+        item,
+        file_stem,
+        output_dir,
+        device,
+        dynamic_img,
+        luma_image,
+        rois,
+        sub_frame_crops,
+        overlay_path,
+        roi_overlay,
+    })
+}
+
+/// Stage 2: Concurrent neural face/feature detection, descriptor matching, and sub-frame alignment.
+#[allow(clippy::cast_precision_loss)]
+fn stage_vision_and_align(mut payload: VisionStagePayload) -> Result<AlignedStagePayload> {
+    // Run Face Detection and SuperPoint Feature Extraction concurrently via rayon::join
+    let (frame_faces, feature_frames_res) = rayon::join(
+        || {
+            if payload.sub_frame_crops.is_empty() {
+                Vec::new()
+            } else {
+                match RetinaFaceDetector::default_engine() {
+                    Ok(face_detector) => match face_detector.detect_faces_for_rois(&payload.sub_frame_crops) {
+                        Ok(records) => {
+                            let total_faces: usize = records.iter().map(|(_, list, _)| list.len()).sum();
+                            if total_faces > 0 {
+                                tracing::debug!(
+                                    file = %payload.file_stem,
+                                    faces = total_faces,
+                                    "Detected faces across sub-frames"
+                                );
+                            }
+                            records
+                        }
+                        Err(e) => {
+                            tracing::warn!(file = %payload.file_stem, error = %e, "Failed to run face detection on sub-frames");
+                            Vec::new()
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!(file = %payload.file_stem, error = %e, "Failed to initialize RetinaFace detector");
+                        Vec::new()
                     }
-                    frame_faces = records;
                 }
-                Err(e) => {
-                    tracing::warn!(file = %file_stem, error = %e, "Failed to run face detection on sub-frames");
-                }
-            },
-            Err(e) => {
-                tracing::warn!(file = %file_stem, error = %e, "Failed to initialize RetinaFace detector");
             }
-        }
-    }
+        },
+        || {
+            use crate::feature::{PointDetector, SuperPointConfig, SuperPointDetector};
+            let point_detector = SuperPointDetector::new(SuperPointConfig {
+                device: payload.device,
+                ..Default::default()
+            });
+            point_detector.detect_luma_all(&payload.luma_image, &payload.rois.frames, None)
+        },
+    );
+
+    let features = feature_frames_res?;
+    let counts: Vec<usize> = features
+        .iter()
+        .map(crate::feature::FeatureFrame::len)
+        .collect();
+    tracing::info!(
+        file = %payload.file_stem,
+        keypoints = ?counts,
+        "Detected frame keypoints"
+    );
 
     let dominant_face_bbox = frame_faces
         .iter()
@@ -648,74 +662,114 @@ pub fn process_item(
             })
         });
 
-    let (overlay_path, roi_overlay) = if item.debug() {
-        let (path, overlay) = render_roi_overlay(&dynamic_img, &rois, &output_dir, &file_stem);
-        (Some(path), Some(overlay))
-    } else {
-        (None, None)
-    };
+    let (triplets, pairs) = match_features(
+        &payload.file_stem,
+        &features,
+        payload.luma_image.orientation,
+        &payload.rois,
+        payload.overlay_path,
+        payload.roi_overlay,
+        &frame_faces,
+    )?;
 
     let mut shifts = [(0.0, 0.0); 3];
-    if let Some(luma) = item.luma_image() {
-        let (features, triplets, pairs) = extract_features(
-            &file_stem,
-            luma,
-            &rois,
-            overlay_path,
-            roi_overlay,
-            item.device(),
-            &frame_faces,
-        )?;
-        if !triplets.is_empty() {
-            shifts = crate::gif::WiggleAligner::compute_depth_surface_shifts_from_triplets_with_face_priority(
-                &features,
-                &triplets,
-                dominant_face_bbox,
-                crate::gif::DEFAULT_DISPARITY_BIN_SIZE_PX,
-                crate::gif::DEFAULT_CLUSTER_TOLERANCE_PX,
-            );
-        } else if !pairs.is_empty() {
-            shifts = crate::gif::WiggleAligner::compute_depth_surface_shifts_from_pairs_with_face_priority(
-                &features,
-                &pairs,
-                dominant_face_bbox,
-                crate::gif::DEFAULT_DISPARITY_BIN_SIZE_PX,
-                crate::gif::DEFAULT_CLUSTER_TOLERANCE_PX,
-            );
-        }
-        item.set_features(features);
+    if !triplets.is_empty() {
+        shifts = crate::gif::WiggleAligner::compute_depth_surface_shifts_from_triplets_with_face_priority(
+            &features,
+            &triplets,
+            dominant_face_bbox,
+            crate::gif::DEFAULT_DISPARITY_BIN_SIZE_PX,
+            crate::gif::DEFAULT_CLUSTER_TOLERANCE_PX,
+        );
+    } else if !pairs.is_empty() {
+        shifts = crate::gif::WiggleAligner::compute_depth_surface_shifts_from_pairs_with_face_priority(
+            &features,
+            &pairs,
+            dominant_face_bbox,
+            crate::gif::DEFAULT_DISPARITY_BIN_SIZE_PX,
+            crate::gif::DEFAULT_CLUSTER_TOLERANCE_PX,
+        );
     }
 
-    if !sub_frame_crops.is_empty() {
-        let (scale_x, scale_y) = if let Some(luma) = item.luma_image() {
-            (
-                dynamic_img.width() as f32 / luma.width as f32,
-                dynamic_img.height() as f32 / luma.height as f32,
-            )
-        } else {
-            (1.0, 1.0)
-        };
+    let aligned_frames = if !payload.sub_frame_crops.is_empty() {
+        let scale_x = payload.dynamic_img.width() as f32 / payload.luma_image.width as f32;
+        let scale_y = payload.dynamic_img.height() as f32 / payload.luma_image.height as f32;
         let scaled_shifts: Vec<(f32, f32)> = shifts
             .iter()
             .map(|&(dx, dy)| (dx * scale_x, dy * scale_y))
             .collect();
-        let aligned_frames =
-            crate::gif::WiggleAligner::align_and_crop(&sub_frame_crops, &scaled_shifts)?;
-        let gif_path = output_dir.join(format!("{file_stem}_wiggle.gif"));
-        let mut gif_file = std::fs::File::create(&gif_path)?;
+        Some(crate::gif::WiggleAligner::align_and_crop(
+            &payload.sub_frame_crops,
+            &scaled_shifts,
+        )?)
+    } else {
+        None
+    };
+
+    payload.item.set_luma_image(payload.luma_image);
+    payload.item.set_features(features);
+
+    Ok(AlignedStagePayload {
+        item: payload.item,
+        file_stem: payload.file_stem,
+        output_dir: payload.output_dir,
+        dynamic_img: payload.dynamic_img,
+        rois: payload.rois,
+        aligned_frames,
+    })
+}
+
+/// Stage 3: In-memory NeuQuant color quantization and GIF byte stream encoding.
+fn stage_quantize_and_encode(mut payload: AlignedStagePayload) -> Result<EncodedStagePayload> {
+    let gif_output = if let Some(ref aligned_frames) = payload.aligned_frames {
+        let gif_path = payload.output_dir.join(format!("{}_wiggle.gif", payload.file_stem));
+        let mut gif_bytes = Vec::new();
         crate::gif::WiggleGifBuilder::build_wiggle_gif(
-            &aligned_frames,
-            &item.gif_config(),
-            &mut gif_file,
+            aligned_frames,
+            &payload.item.gif_config(),
+            &mut gif_bytes,
         )?;
+        Some((gif_path, gif_bytes))
+    } else {
+        None
+    };
+
+    payload.item.set_image(payload.dynamic_img);
+    payload.item.set_rois(payload.rois);
+
+    Ok(EncodedStagePayload {
+        item: payload.item,
+        gif_output,
+    })
+}
+
+/// Stage 4: Disk writer that writes serialized GIF bytes and completes image item processing.
+fn stage_write_output(payload: EncodedStagePayload) -> Result<ImageItemContext> {
+    if let Some((gif_path, gif_bytes)) = payload.gif_output {
+        std::fs::write(&gif_path, gif_bytes)?;
         tracing::info!(gif_path = ?gif_path, "Saved Wiggle 3D GIF");
     }
+    tracing::info!(file = ?payload.item.source_path(), "Processed image item successfully");
+    Ok(payload.item)
+}
 
-    item.set_image(dynamic_img);
-    item.set_rois(rois);
-
-    tracing::info!(file = ?source_path, "Processed image item successfully");
-    Ok(item)
+/// Processes a single image item context through detection, visualization, and feature extraction.
+///
+/// # Arguments
+/// * `item` - The image item context to process.
+/// * `config` - Detection parameters.
+///
+/// # Errors
+/// Returns [`Error`] if image loading, `RoI` detection, or feature extraction fails.
+#[tracing::instrument(level = "debug", skip_all)]
+pub fn process_item(
+    item: ImageItemContext,
+    config: &RoiDetectionConfig,
+) -> Result<ImageItemContext> {
+    let vision_payload = stage_decode_and_roi(item, config)?;
+    let aligned_payload = stage_vision_and_align(vision_payload)?;
+    let encoded_payload = stage_quantize_and_encode(aligned_payload)?;
+    stage_write_output(encoded_payload)
 }
 
 /// Processes a single film strip image: detects `RoIs`, generates visual overlay, and exports sub-frame crops.
@@ -741,7 +795,8 @@ pub fn process_single_image(
 
 /// Drives processing for a verified batch of image files.
 ///
-/// Executes per-item processing concurrently across available CPU threads using `rayon`.
+/// Executes per-item processing via a 4-stage pipelined streaming dataflow with bounded
+/// channel backpressure to overlap disk I/O, neural inference, and color quantization.
 /// Assumes file list verification has already been conducted by the front-end.
 ///
 /// # Arguments
@@ -771,12 +826,19 @@ pub fn run_batch(request: &BatchProcessingRequest) -> Result<ProcessSummary> {
     let items = request.create_item_contexts();
     let total = items.len();
 
-    let counts = items
-        .into_par_iter()
-        .enumerate()
-        .map(|(idx, item)| {
+    let concurrency_limit = rayon::current_num_threads().clamp(2, 8);
+    let (tx_vision, rx_vision) = crossbeam_channel::bounded(concurrency_limit);
+    let (tx_aligned, rx_aligned) = crossbeam_channel::bounded(concurrency_limit);
+    let (tx_encoded, rx_encoded) = crossbeam_channel::bounded(concurrency_limit);
+
+    // Stage 1: File Ingestion & Reader
+    let items_for_ingest = items;
+    let config_clone = config;
+    let observer_start = request.progress_observer.clone();
+    std::thread::spawn(move || {
+        for (idx, item) in items_for_ingest.into_iter().enumerate() {
             let file_stem = item.file_stem().to_string();
-            if let Some(ref observer) = request.progress_observer {
+            if let Some(ref observer) = observer_start {
                 observer.on_progress(ProgressEvent::ItemStarted {
                     file_stem: &file_stem,
                     index: idx + 1,
@@ -784,39 +846,108 @@ pub fn run_batch(request: &BatchProcessingRequest) -> Result<ProcessSummary> {
                 });
             }
 
-            let outcome = match process_item(item, &config) {
+            let result = stage_decode_and_roi(item, &config_clone)
+                .map(|payload| (idx + 1, file_stem.clone(), payload))
+                .map_err(|e| (idx + 1, file_stem, e));
+
+            if tx_vision.send(result).is_err() {
+                break;
+            }
+        }
+    });
+
+    // Stage 2: Vision & Neural Alignment Workers (Dedicated Threads)
+    for _ in 0..concurrency_limit {
+        let rx = rx_vision.clone();
+        let tx = tx_aligned.clone();
+        std::thread::spawn(move || {
+            while let Ok(msg) = rx.recv() {
+                let result = match msg {
+                    Ok((idx, stem, payload)) => match stage_vision_and_align(payload) {
+                        Ok(aligned) => Ok((idx, stem, aligned)),
+                        Err(e) => Err((idx, stem, e)),
+                    },
+                    Err(err) => Err(err),
+                };
+                if tx.send(result).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    drop(tx_aligned); // Drop orchestrator sender so channel closes when workers finish
+
+    // Stage 3: Quantization & GIF Encoding Workers (Dedicated Threads)
+    for _ in 0..concurrency_limit {
+        let rx = rx_aligned.clone();
+        let tx = tx_encoded.clone();
+        std::thread::spawn(move || {
+            while let Ok(msg) = rx.recv() {
+                let result = match msg {
+                    Ok((idx, stem, payload)) => match stage_quantize_and_encode(payload) {
+                        Ok(encoded) => Ok((idx, stem, encoded)),
+                        Err(e) => Err((idx, stem, e)),
+                    },
+                    Err(err) => Err(err),
+                };
+                if tx.send(result).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    drop(tx_encoded); // Drop orchestrator sender so channel closes when workers finish
+
+    // Stage 4: Background File Writer & Progress Collector (Current Thread)
+    let mut successful_count = 0;
+    let mut failed_count = 0;
+
+    while let Ok(msg) = rx_encoded.recv() {
+        match msg {
+            Ok((idx, stem, payload)) => match stage_write_output(payload) {
                 Ok(_) => {
                     if let Some(ref observer) = request.progress_observer {
                         observer.on_progress(ProgressEvent::ItemCompleted {
-                            file_stem: &file_stem,
-                            index: idx + 1,
+                            file_stem: &stem,
+                            index: idx,
                             total,
                             success: true,
                         });
                     }
-                    ItemProcessingOutcome::Success
+                    successful_count += 1;
                 }
-                Err(err) => {
-                    tracing::error!(file = %file_stem, error = ?err, "Failed processing image");
+                Err(e) => {
+                    tracing::error!(file = %stem, error = ?e, "Failed writing output files");
                     if let Some(ref observer) = request.progress_observer {
                         observer.on_progress(ProgressEvent::ItemCompleted {
-                            file_stem: &file_stem,
-                            index: idx + 1,
+                            file_stem: &stem,
+                            index: idx,
                             total,
                             success: false,
                         });
                     }
-                    ItemProcessingOutcome::Failure
+                    failed_count += 1;
                 }
-            };
-            ItemProcessingCounts::from_outcome(outcome)
-        })
-        .reduce(ItemProcessingCounts::default, ItemProcessingCounts::combine);
+            },
+            Err((idx, stem, err)) => {
+                tracing::error!(file = %stem, error = ?err, "Failed processing image");
+                if let Some(ref observer) = request.progress_observer {
+                    observer.on_progress(ProgressEvent::ItemCompleted {
+                        file_stem: &stem,
+                        index: idx,
+                        total,
+                        success: false,
+                    });
+                }
+                failed_count += 1;
+            }
+        }
+    }
 
     let summary = ProcessSummary {
         total_input,
-        successful_count: counts.successful_count,
-        failed_count: counts.failed_count,
+        successful_count,
+        failed_count,
     };
 
     tracing::info!(
