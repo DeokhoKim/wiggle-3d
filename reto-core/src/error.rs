@@ -63,6 +63,67 @@ pub enum RoiError {
     ZeroExpectedFrames(usize),
 }
 
+/// Errors occurring during feature extraction, matching, and parallax alignment.
+#[derive(Error, Debug, Clone, PartialEq)]
+pub enum AlignmentError {
+    /// Deep learning model inference failure.
+    #[error("Inference failure: {0}")]
+    Inference(String),
+
+    /// Model loading or initialization error.
+    #[error("Model load error: {0}")]
+    ModelLoad(String),
+
+    /// Tensor shape, layout, or type mismatch.
+    #[error("Tensor layout mismatch: {0}")]
+    TensorLayout(String),
+
+    /// Requested execution provider or backend device is unavailable.
+    #[error("Backend unavailable: {0}")]
+    BackendUnavailable(String),
+
+    /// Insufficient keypoints extracted for robust correspondence.
+    #[error("Insufficient keypoints: detected {found}, minimum required is {required}")]
+    InsufficientKeypoints {
+        /// Number of keypoints found.
+        found: usize,
+        /// Minimum number required.
+        required: usize,
+    },
+
+    /// Invalid input parameters or image buffer dimensions.
+    #[error("Invalid alignment input: {0}")]
+    InvalidInput(String),
+
+    /// Underlying `RoI` extraction or geometric error.
+    #[error("RoI error during alignment: {0}")]
+    Roi(#[from] RoiError),
+}
+
+/// Errors occurring during face detection and facial focal plane selection.
+#[derive(Error, Debug, Clone, PartialEq)]
+pub enum FaceError {
+    /// Deep learning model inference failure.
+    #[error("Inference failure: {0}")]
+    Inference(String),
+
+    /// Model loading or initialization error.
+    #[error("Model load error: {0}")]
+    ModelLoad(String),
+
+    /// Tensor shape, layout, or type mismatch.
+    #[error("Tensor layout mismatch: {0}")]
+    TensorLayout(String),
+
+    /// Invalid input parameters or image buffer dimensions.
+    #[error("Invalid face detection input: {0}")]
+    InvalidInput(String),
+
+    /// Region of Interest or geometry error during face detection.
+    #[error("RoI error during face detection: {0}")]
+    Roi(#[from] RoiError),
+}
+
 /// Common error type for reto-core.
 #[derive(Debug, Error)]
 pub enum Error {
@@ -73,6 +134,14 @@ pub enum Error {
     /// `RoI` detection / geometry error wrapper.
     #[error("RoI error: {0}")]
     Roi(#[from] RoiError),
+
+    /// Feature alignment and parallax error wrapper.
+    #[error("Alignment error: {0}")]
+    Alignment(#[from] AlignmentError),
+
+    /// Face detection and focal plane error wrapper.
+    #[error("Face error: {0}")]
+    Face(#[from] FaceError),
 
     /// Image processing error wrapper.
     #[error("Image error: {0}")]

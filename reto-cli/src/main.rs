@@ -5,7 +5,10 @@
 //! verified file lists to `reto-core::run_batch`.
 
 use clap::Parser;
-use reto_core::{is_supported_image, run_batch, BatchProcessingRequest};
+use reto_core::{
+    clear_retinaface_model_cache, clear_superpoint_model_cache, is_supported_image, run_batch,
+    BatchProcessingRequest,
+};
 use std::path::{Path, PathBuf};
 use tracing_subscriber::EnvFilter;
 
@@ -30,7 +33,15 @@ pub struct Cli {
     #[arg(long)]
     pub debug: bool,
 
-    /// Verbose output logging level (-v for debug, -vv for trace)
+    /// Inter-frame delay for Wiggle GIF in milliseconds (default: 100ms)
+    #[arg(long, default_value_t = reto_core::DEFAULT_FRAME_DELAY_MS, value_name = "MS")]
+    pub gif_delay: u32,
+
+    /// Disable Floyd-Steinberg dithering during GIF color quantization
+    #[arg(long)]
+    pub no_dither: bool,
+
+    /// Verbose logging level (-v for debug, -vv for trace)
     #[arg(short, long, action = clap::ArgAction::Count)]
     pub verbose: u8,
 }
@@ -70,16 +81,19 @@ fn main() -> anyhow::Result<()> {
     let filter_directive = match cli.verbose {
         0 => {
             if cli.debug {
-                "debug"
+                "debug,ort=info"
             } else {
-                "info"
+                "info,ort=warn"
             }
         }
-        1 => "debug",
-        _ => "trace",
+        1 => "debug,ort=info",
+        _ => "trace,ort=info",
     };
 
     tracing_subscriber::fmt()
+        .with_timer(tracing_subscriber::fmt::time::UtcTime::rfc_3339())
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+        .with_target(true)
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter_directive)),
         )
@@ -98,7 +112,9 @@ fn main() -> anyhow::Result<()> {
         "Verified input files for processing"
     );
 
-    let request = BatchProcessingRequest::new(files, cli.output.clone(), cli.debug);
+    let gif_config = reto_core::WiggleGifConfig::new(cli.gif_delay).with_dither(!cli.no_dither);
+    let request = BatchProcessingRequest::new(files, cli.output.clone(), cli.debug)
+        .with_gif_config(gif_config);
     let summary = run_batch(&request)?;
 
     println!(
@@ -116,6 +132,10 @@ fn main() -> anyhow::Result<()> {
             "Completed with some failures"
         );
     }
+
+    // Release compiled SuperPoint and RetinaFace models from memory at program exit
+    clear_superpoint_model_cache();
+    clear_retinaface_model_cache();
 
     Ok(())
 }

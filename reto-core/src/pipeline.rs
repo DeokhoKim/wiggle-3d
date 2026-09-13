@@ -5,8 +5,10 @@
 
 use crate::detector::{PillarStatsDetector, RoiDetectionConfig, RoiDetector};
 use crate::error::Result;
+use crate::face::RetinaFaceDetector;
+use crate::feature::AlignmentDiagnosticTap;
 use crate::geom::FrameRoiSet;
-use crate::luma::{Bt709LumaConverter, ScaledGrayscaleStrip, PROJECTION_MAX_DIMENSION};
+use crate::luma::{Bt709LumaConverter, ScaledLumaImage, PROJECTION_MAX_DIMENSION};
 use crate::visualizer::RoiVisualizer;
 use image::{DynamicImage, Rgba};
 use rayon::prelude::*;
@@ -18,27 +20,29 @@ pub const SUPPORTED_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "bmp", "tiff",
 /// Checks if the given path has a supported image extension according to core format support.
 ///
 /// # Arguments
-/// * `path` - File path to inspect.
+/// * `path` - The file path to test.
 ///
 /// # Examples
 /// ```
 /// use reto_core::is_supported_image;
 /// use std::path::Path;
 ///
-/// assert!(is_supported_image(Path::new("scan.jpg")));
-/// assert!(!is_supported_image(Path::new("notes.txt")));
+/// assert!(is_supported_image(Path::new("scan.JPG")));
+/// assert!(!is_supported_image(Path::new("scan.txt")));
 /// ```
 #[must_use]
-pub fn is_supported_image(path: &Path) -> bool {
-    path.extension()
+pub fn is_supported_image<P: AsRef<Path>>(path: P) -> bool {
+    path.as_ref()
+        .extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| {
-            let ext_lower = ext.to_ascii_lowercase();
-            SUPPORTED_EXTENSIONS.contains(&ext_lower.as_str())
+            SUPPORTED_EXTENSIONS
+                .iter()
+                .any(|&supported| ext.eq_ignore_ascii_case(supported))
         })
 }
 
-/// Independent processing context for a single film strip image.
+/// Independent processing context for a single film scan image.
 ///
 /// Encapsulates per-image source metadata, decoded buffers, and intermediate
 /// analysis state across processing pipeline stages to ensure thread safety
@@ -62,8 +66,16 @@ pub struct ImageItemContext {
     image: Option<DynamicImage>,
     /// Intermediate detection results (frame regions of interest).
     rois: Option<FrameRoiSet>,
-    /// Scaled grayscale / luma strip buffer for reusable vision analysis.
-    luma_strip: Option<ScaledGrayscaleStrip>,
+    /// Scaled single-channel luma image buffer for reusable vision analysis.
+    luma_image: Option<ScaledLumaImage>,
+    /// Extracted feature keypoints for each detected sub-frame.
+    features: Option<Vec<crate::feature::FeatureFrame>>,
+    /// Target execution device for model inference.
+    device: crate::feature::BackendDevice,
+    /// Configuration for Wiggle GIF generation.
+    gif_config: crate::gif::WiggleGifConfig,
+    /// Whether debug visualization mode is enabled.
+    debug: bool,
 }
 
 impl ImageItemContext {
@@ -79,7 +91,15 @@ impl ImageItemContext {
             output_dir,
             image: None,
             rois: None,
-            luma_strip: None,
+            luma_image: None,
+            features: None,
+            device: crate::feature::BackendDevice::Auto,
+            gif_config: crate::gif::WiggleGifConfig {
+                delay_ms: crate::gif::DEFAULT_FRAME_DELAY_MS,
+                sample_factor: crate::gif::DEFAULT_NEUQUANT_SAMPLE_FAC,
+                dither: true,
+            },
+            debug: false,
         }
     }
 
@@ -136,20 +156,87 @@ impl ImageItemContext {
         self.rois.take()
     }
 
-    /// Sets the scaled grayscale / luma strip.
-    pub fn set_luma_strip(&mut self, strip: ScaledGrayscaleStrip) {
-        self.luma_strip = Some(strip);
+    /// Sets the scaled luma image buffer.
+    pub fn set_luma_image(&mut self, luma: ScaledLumaImage) {
+        self.luma_image = Some(luma);
     }
 
-    /// Reference to the scaled grayscale / luma strip if generated.
+    /// Backward-compatible alias for [`ImageItemContext::set_luma_image`].
+    pub fn set_luma_strip(&mut self, luma: ScaledLumaImage) {
+        self.set_luma_image(luma);
+    }
+
+    /// Reference to the scaled luma image if generated.
     #[must_use]
-    pub const fn luma_strip(&self) -> Option<&ScaledGrayscaleStrip> {
-        self.luma_strip.as_ref()
+    pub const fn luma_image(&self) -> Option<&ScaledLumaImage> {
+        self.luma_image.as_ref()
     }
 
-    /// Takes the scaled grayscale / luma strip, leaving `None` in its place.
-    pub const fn take_luma_strip(&mut self) -> Option<ScaledGrayscaleStrip> {
-        self.luma_strip.take()
+    /// Backward-compatible alias for [`ImageItemContext::luma_image`].
+    #[must_use]
+    pub const fn luma_strip(&self) -> Option<&ScaledLumaImage> {
+        self.luma_image()
+    }
+
+    /// Takes the scaled luma image buffer, leaving `None` in its place.
+    pub const fn take_luma_image(&mut self) -> Option<ScaledLumaImage> {
+        self.luma_image.take()
+    }
+
+    /// Backward-compatible alias for [`ImageItemContext::take_luma_image`].
+    pub const fn take_luma_strip(&mut self) -> Option<ScaledLumaImage> {
+        self.take_luma_image()
+    }
+
+    /// Sets the extracted feature frames.
+    pub fn set_features(&mut self, features: Vec<crate::feature::FeatureFrame>) {
+        self.features = Some(features);
+    }
+
+    /// Reference to extracted feature frames if present.
+    #[must_use]
+    pub fn features(&self) -> Option<&[crate::feature::FeatureFrame]> {
+        self.features.as_deref()
+    }
+
+    /// Returns the target execution device for model inference.
+    #[must_use]
+    pub const fn device(&self) -> crate::feature::BackendDevice {
+        self.device
+    }
+
+    /// Sets the target execution device for model inference.
+    pub const fn set_device(&mut self, device: crate::feature::BackendDevice) {
+        self.device = device;
+    }
+
+    /// Returns the Wiggle GIF generation configuration.
+    #[must_use]
+    pub const fn gif_config(&self) -> crate::gif::WiggleGifConfig {
+        self.gif_config
+    }
+
+    /// Sets the Wiggle GIF generation configuration.
+    pub const fn set_gif_config(&mut self, gif_config: crate::gif::WiggleGifConfig) {
+        self.gif_config = gif_config;
+    }
+
+    /// Returns whether debug visualization mode is enabled.
+    #[must_use]
+    pub const fn debug(&self) -> bool {
+        self.debug
+    }
+
+    /// Sets whether debug visualization mode is enabled.
+    pub const fn set_debug(&mut self, debug: bool) {
+        self.debug = debug;
+    }
+
+    /// Builder method to set debug visualization mode.
+    #[must_use]
+    pub const fn with_debug(mut self, debug: bool) -> Self {
+        self.debug = debug;
+        self
     }
 }
 
@@ -157,11 +244,12 @@ impl ImageItemContext {
 ///
 /// # Examples
 /// ```
-/// use reto_core::BatchProcessingRequest;
+/// use reto_core::{BackendDevice, BatchProcessingRequest};
 /// use std::path::PathBuf;
 ///
 /// let req = BatchProcessingRequest::new(vec![PathBuf::from("img.png")], PathBuf::from("dist"), true);
 /// assert!(req.debug);
+/// assert_eq!(req.device, BackendDevice::Auto);
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchProcessingRequest {
@@ -171,6 +259,10 @@ pub struct BatchProcessingRequest {
     pub output_dir: PathBuf,
     /// Whether debug visualization mode is enabled.
     pub debug: bool,
+    /// Compute device / execution provider for model inference.
+    pub device: crate::feature::BackendDevice,
+    /// Configuration for Wiggle GIF generation.
+    pub gif_config: crate::gif::WiggleGifConfig,
 }
 
 impl BatchProcessingRequest {
@@ -186,7 +278,27 @@ impl BatchProcessingRequest {
             files,
             output_dir,
             debug,
+            device: crate::feature::BackendDevice::Auto,
+            gif_config: crate::gif::WiggleGifConfig {
+                delay_ms: crate::gif::DEFAULT_FRAME_DELAY_MS,
+                sample_factor: crate::gif::DEFAULT_NEUQUANT_SAMPLE_FAC,
+                dither: true,
+            },
         }
+    }
+
+    /// Sets the compute device for inference.
+    #[must_use]
+    pub const fn with_device(mut self, device: crate::feature::BackendDevice) -> Self {
+        self.device = device;
+        self
+    }
+
+    /// Sets the Wiggle GIF generation configuration.
+    #[must_use]
+    pub const fn with_gif_config(mut self, gif_config: crate::gif::WiggleGifConfig) -> Self {
+        self.gif_config = gif_config;
+        self
     }
 
     /// Creates independent per-image processing contexts from this batch request.
@@ -194,7 +306,13 @@ impl BatchProcessingRequest {
     pub fn create_item_contexts(&self) -> Vec<ImageItemContext> {
         self.files
             .iter()
-            .map(|path| ImageItemContext::new(path.clone(), self.output_dir.clone()))
+            .map(|path| {
+                let mut ctx = ImageItemContext::new(path.clone(), self.output_dir.clone());
+                ctx.set_device(self.device);
+                ctx.set_gif_config(self.gif_config);
+                ctx.set_debug(self.debug);
+                ctx
+            })
             .collect()
     }
 }
@@ -257,6 +375,180 @@ pub struct ProcessSummary {
 ///
 /// # Errors
 /// Returns [`Error`] if image decoding, `RoI` detection, or file saving fails.
+#[tracing::instrument(level = "debug", skip_all)]
+fn load_image(item: &mut ImageItemContext) -> Result<DynamicImage> {
+    match item.image.take() {
+        Some(img) => Ok(img),
+        None => Ok(image::open(item.source_path())?),
+    }
+}
+
+#[tracing::instrument(level = "debug", skip_all)]
+fn prepare_luma(dynamic_img: &DynamicImage) -> Result<ScaledLumaImage> {
+    ScaledLumaImage::from_image(
+        dynamic_img,
+        &Bt709LumaConverter::new(),
+        PROJECTION_MAX_DIMENSION,
+    )
+    .map_err(Into::into)
+}
+
+#[tracing::instrument(level = "debug", skip(luma, config, tap))]
+fn detect_rois(
+    luma: &ScaledLumaImage,
+    config: &RoiDetectionConfig,
+    tap: Option<&dyn crate::detector::RoiDiagnosticTap>,
+) -> Result<FrameRoiSet> {
+    let detector = PillarStatsDetector::new();
+    let rois = detector.detect_luma(luma, config, tap)?;
+    tracing::debug!(
+        orientation = ?rois.orientation,
+        frame_count = rois.len(),
+        "Detected frame RoIs"
+    );
+    let bounds: Vec<_> = rois.frames.iter().map(|f| &f.bounds).collect();
+    tracing::debug!(
+        bounds = ?bounds,
+        "Frame RoI bounds configured"
+    );
+    Ok(rois)
+}
+
+#[tracing::instrument(level = "debug", skip(dynamic_img, rois))]
+fn render_roi_overlay(
+    dynamic_img: &DynamicImage,
+    rois: &FrameRoiSet,
+    output_dir: &Path,
+    file_stem: &str,
+) -> (PathBuf, DynamicImage) {
+    let border_color = Rgba([0, 255, 128, 255]); // High-contrast emerald green
+    let roi_overlay = RoiVisualizer::render_overlay(dynamic_img, rois, border_color, 4);
+    let overlay_path = output_dir.join(format!("{file_stem}_roi_overlay.png"));
+    (overlay_path, DynamicImage::ImageRgba8(roi_overlay))
+}
+
+#[allow(clippy::type_complexity)]
+#[tracing::instrument(level = "debug", skip_all)]
+fn extract_features(
+    file_stem: &str,
+    luma: &ScaledLumaImage,
+    rois: &FrameRoiSet,
+    overlay_path: Option<PathBuf>,
+    roi_overlay: Option<DynamicImage>,
+    device: crate::feature::BackendDevice,
+    frame_faces: &[crate::visualizer::FrameFaceRecord],
+) -> Result<(
+    Vec<crate::feature::FeatureFrame>,
+    Vec<crate::feature::FeatureTriplet>,
+    Vec<(crate::feature::FramePair, Vec<crate::feature::FeatureMatch>)>,
+)> {
+    use crate::feature::{
+        FeatureMatcher, PointDetector, SuperPointConfig, SuperPointDescriptorMatcher,
+        SuperPointDetector, TripletConsistencyConfig,
+    };
+
+    let config = SuperPointConfig {
+        device,
+        ..Default::default()
+    };
+    let point_detector = SuperPointDetector::new(config);
+    let features = point_detector.detect_luma_all(luma, &rois.frames, None)?;
+
+    let counts: Vec<usize> = features
+        .iter()
+        .map(crate::feature::FeatureFrame::len)
+        .collect();
+    tracing::info!(
+        file = %file_stem,
+        keypoints = ?counts,
+        "Detected frame keypoints"
+    );
+
+    let mut extracted_triplets = Vec::new();
+    let mut extracted_pairs = Vec::new();
+
+    // If at least 2 frames exist, match across frames
+    if features.len() >= 2 {
+        let matcher = SuperPointDescriptorMatcher::default();
+        let consistency_config = TripletConsistencyConfig::with_orientation(luma.orientation);
+
+        let tap = match (overlay_path, roi_overlay) {
+            (Some(path), Some(overlay)) => {
+                let t = crate::visualizer::SaveMatchesDiagnosticTap::new(
+                    Some(path),
+                    None,
+                    overlay,
+                )
+                .with_rois(rois.clone());
+                t.add_faces(frame_faces);
+                for (idx, frame) in features.iter().enumerate() {
+                    t.on_features_extracted(idx, frame);
+                }
+                Some(t)
+            }
+            _ => None,
+        };
+
+        if features.len() >= 3 {
+            match matcher.extract_consistent_triplets(
+                &features,
+                &consistency_config,
+                tap.as_ref().map(|t| t as &dyn AlignmentDiagnosticTap),
+            ) {
+                Ok(triplets) => {
+                    tracing::info!(
+                        file = %file_stem,
+                        triplet_count = triplets.len(),
+                        "Extracted depth-consistent feature triplets across 3 views"
+                    );
+                    extracted_triplets = triplets;
+                }
+                Err(e) => {
+                    tracing::warn!(file = %file_stem, error = %e, "Failed to extract feature triplets; falling back to pairwise matching");
+                }
+            }
+        } else {
+            let pair_matches = matcher.match_pair_bidirectional(&features[0], &features[1])?;
+            if let Some(ref t) = tap {
+                t.on_matches_found(pair_matches.pair, &pair_matches.matches);
+            }
+            extracted_pairs.push((pair_matches.pair, pair_matches.matches));
+        }
+
+        if let Some(t) = tap {
+            t.finish()?;
+        }
+    } else if let (Some(path), Some(overlay)) = (overlay_path, roi_overlay) {
+        // Fallback: draw keypoints on overlay if fewer than 2 frames and debug overlay is requested
+        let feat_tap = crate::visualizer::SaveFeaturesDiagnosticTap::new(
+            path,
+            overlay,
+            Rgba([255, 64, 128, 255]),
+        )
+        .with_rois(rois.clone());
+        for (idx, frame) in features.iter().enumerate() {
+            feat_tap.on_features_extracted(idx, frame);
+        }
+        feat_tap.finish()?;
+    }
+
+    Ok((features, extracted_triplets, extracted_pairs))
+}
+
+/// Processes a single image item context through detection, visualization, and feature extraction.
+///
+/// # Arguments
+/// * `item` - The image item context to process.
+/// * `config` - Detection parameters.
+///
+/// # Errors
+/// Returns [`Error`] if image loading, `RoI` detection, or feature extraction fails.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::option_if_let_else,
+    clippy::too_many_lines
+)]
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn process_item(
     mut item: ImageItemContext,
     config: &RoiDetectionConfig,
@@ -265,62 +557,120 @@ pub fn process_item(
     let file_stem = item.file_stem().to_string();
     let output_dir = item.output_dir().to_path_buf();
 
-    tracing::info!(file = ?source_path, "Loading input image");
-    let dynamic_img = match item.image.take() {
-        Some(img) => img,
-        None => image::open(&source_path)?,
-    };
+    let dynamic_img = load_image(&mut item)?;
 
-    let mut composite_tap = crate::detector::CompositeDiagnosticTap::new();
-    let luma_tap = crate::detector::SaveLumaDiagnosticTap::new(
-        output_dir.join(format!("{file_stem}_luma.png")),
-    );
-    composite_tap.add(&luma_tap);
+    let luma_image = prepare_luma(&dynamic_img)?;
+    let rois = detect_rois(&luma_image, config, None)?;
+    item.set_luma_image(luma_image);
 
-    // Precompute luma strip and register in ImageItemContext container for reuse
-    let luma_strip = ScaledGrayscaleStrip::from_image(
-        &dynamic_img,
-        &Bt709LumaConverter::new(),
-        PROJECTION_MAX_DIMENSION,
-    )?;
-    item.set_luma_strip(luma_strip);
+    // Extract sub-frame crops for face detection and Wiggle GIF assembly
+    let sub_frame_crops = RoiVisualizer::extract_frame_images(&dynamic_img, &rois)?;
 
-    let detector = PillarStatsDetector::new();
-    let rois = detector.detect(&dynamic_img, config, Some(&composite_tap))?;
-
-    tracing::info!(
-        file = ?source_path,
-        orientation = ?rois.orientation,
-        frame_count = rois.len(),
-        "Detected frame RoIs"
-    );
-
-    for frame in &rois.frames {
-        tracing::info!(
-            frame_index = frame.index,
-            bounds = ?frame.bounds,
-            "Frame RoI detected"
-        );
+    // Detect faces across each extracted sub-frame crop (batch of individual frames)
+    let mut frame_faces = Vec::new();
+    if !sub_frame_crops.is_empty() {
+        match RetinaFaceDetector::default_engine() {
+            Ok(face_detector) => match face_detector.detect_faces_for_rois(&sub_frame_crops) {
+                Ok(records) => {
+                    let total_faces: usize = records.iter().map(|(_, list, _)| list.len()).sum();
+                    if total_faces > 0 {
+                        tracing::debug!(
+                            file = %file_stem,
+                            faces = total_faces,
+                            "Detected faces across sub-frames"
+                        );
+                    }
+                    frame_faces = records;
+                }
+                Err(e) => {
+                    tracing::warn!(file = %file_stem, error = %e, "Failed to run face detection on sub-frames");
+                }
+            },
+            Err(e) => {
+                tracing::warn!(file = %file_stem, error = %e, "Failed to initialize RetinaFace detector");
+            }
+        }
     }
 
-    // Render debug visual overlay with drawn RoI bounding boxes
-    let border_color = Rgba([0, 255, 128, 255]); // High-contrast emerald green
-    let overlay = RoiVisualizer::render_overlay(&dynamic_img, &rois, border_color, 4);
+    let dominant_face_bbox = frame_faces
+        .iter()
+        .find(|(f_idx, _, dom_idx)| *f_idx == 1 && dom_idx.is_some())
+        .and_then(|(_, detections, dom_idx)| {
+            dom_idx.and_then(|idx| detections.get(idx).map(|f| f.bbox))
+        })
+        .or_else(|| {
+            frame_faces.iter().find_map(|(_, detections, dom_idx)| {
+                dom_idx.and_then(|idx| detections.get(idx).map(|f| f.bbox))
+            })
+        });
 
-    let overlay_path = output_dir.join(format!("{file_stem}_roi_overlay.png"));
-    overlay.save(&overlay_path)?;
-    tracing::info!(overlay_path = ?overlay_path, "Saved RoI visual overlay");
+    let (overlay_path, roi_overlay) = if item.debug() {
+        let (path, overlay) = render_roi_overlay(&dynamic_img, &rois, &output_dir, &file_stem);
+        (Some(path), Some(overlay))
+    } else {
+        (None, None)
+    };
 
-    // Frame extraction intentionally disabled until explicitly requested:
-    // let crops = RoiVisualizer::extract_frame_images(&dynamic_img, &rois)?;
-    // for (i, crop) in crops.iter().enumerate() {
-    //     let frame_path = output_dir.join(format!("{file_stem}_frame_{i}.png"));
-    //     crop.save(&frame_path)?;
-    // }
+    let mut shifts = [(0.0, 0.0); 3];
+    if let Some(luma) = item.luma_image() {
+        let (features, triplets, pairs) = extract_features(
+            &file_stem,
+            luma,
+            &rois,
+            overlay_path,
+            roi_overlay,
+            item.device(),
+            &frame_faces,
+        )?;
+        if !triplets.is_empty() {
+            shifts = crate::gif::WiggleAligner::compute_depth_surface_shifts_from_triplets_with_face_priority(
+                &features,
+                &triplets,
+                dominant_face_bbox,
+                crate::gif::DEFAULT_DISPARITY_BIN_SIZE_PX,
+                crate::gif::DEFAULT_CLUSTER_TOLERANCE_PX,
+            );
+        } else if !pairs.is_empty() {
+            shifts = crate::gif::WiggleAligner::compute_depth_surface_shifts_from_pairs_with_face_priority(
+                &features,
+                &pairs,
+                dominant_face_bbox,
+                crate::gif::DEFAULT_DISPARITY_BIN_SIZE_PX,
+                crate::gif::DEFAULT_CLUSTER_TOLERANCE_PX,
+            );
+        }
+        item.set_features(features);
+    }
+
+    if !sub_frame_crops.is_empty() {
+        let (scale_x, scale_y) = if let Some(luma) = item.luma_image() {
+            (
+                dynamic_img.width() as f32 / luma.width as f32,
+                dynamic_img.height() as f32 / luma.height as f32,
+            )
+        } else {
+            (1.0, 1.0)
+        };
+        let scaled_shifts: Vec<(f32, f32)> = shifts
+            .iter()
+            .map(|&(dx, dy)| (dx * scale_x, dy * scale_y))
+            .collect();
+        let aligned_frames =
+            crate::gif::WiggleAligner::align_and_crop(&sub_frame_crops, &scaled_shifts)?;
+        let gif_path = output_dir.join(format!("{file_stem}_wiggle.gif"));
+        let mut gif_file = std::fs::File::create(&gif_path)?;
+        crate::gif::WiggleGifBuilder::build_wiggle_gif(
+            &aligned_frames,
+            &item.gif_config(),
+            &mut gif_file,
+        )?;
+        tracing::info!(gif_path = ?gif_path, "Saved Wiggle 3D GIF");
+    }
 
     item.set_image(dynamic_img);
     item.set_rois(rois);
 
+    tracing::info!(file = ?source_path, "Processed image item successfully");
     Ok(item)
 }
 
@@ -355,6 +705,7 @@ pub fn process_single_image(
 ///
 /// # Errors
 /// Returns [`Error::Io`] if output directory creation fails.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn run_batch(request: &BatchProcessingRequest) -> Result<ProcessSummary> {
     if request.files.is_empty() {
         tracing::warn!("Batch request contains no files to process");
@@ -433,16 +784,20 @@ mod tests {
         let img = RgbaImage::from_pixel(300, 100, Rgba([200, 200, 200, 255]));
         img.save(&input_path).unwrap();
 
-        let request = BatchProcessingRequest::new(vec![input_path], output_path.clone(), false);
-        let summary = run_batch(&request).expect("Batch should run");
-
+        // Non-debug run: verify wiggle GIF is saved, but roi_overlay is NOT saved
+        let request_non_debug =
+            BatchProcessingRequest::new(vec![input_path.clone()], output_path.clone(), false);
+        let summary = run_batch(&request_non_debug).expect("Non-debug batch should run");
         assert_eq!(summary.total_input, 1);
         assert_eq!(summary.successful_count, 1);
-        assert_eq!(summary.failed_count, 0);
+        assert!(!output_path.join("sample_strip_roi_overlay.png").exists());
+        assert!(output_path.join("sample_strip_wiggle.gif").exists());
 
-        // Verify generated artifacts (overlay and intermediate luma are saved)
+        // Debug run: verify roi_overlay is saved when debug is enabled
+        let request_debug = BatchProcessingRequest::new(vec![input_path], output_path.clone(), true);
+        let summary_debug = run_batch(&request_debug).expect("Debug batch should run");
+        assert_eq!(summary_debug.successful_count, 1);
         assert!(output_path.join("sample_strip_roi_overlay.png").exists());
-        assert!(output_path.join("sample_strip_luma.png").exists());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

@@ -308,6 +308,7 @@ impl PrioritizedPartitionEngine {
 
     /// Evaluates the priority chain against the axis profile and returns the first validated partition.
     #[must_use]
+    #[tracing::instrument(skip(self, profile), level = "debug")]
     pub fn execute(
         &self,
         profile: &AxisStatisticsProfile,
@@ -322,19 +323,19 @@ impl PrioritizedPartitionEngine {
                     .validator
                     .is_reasonable(&candidate, expected_frames, major_len)
                 {
-                    tracing::info!(
-                        priority = priority + 1,
+                    tracing::debug!(
                         strategy = name,
-                        confidence = candidate.confidence,
+                        priority = priority + 1,
+                        confidence = format_args!("{:.2}", candidate.confidence),
                         frame_count = candidate.frame_spans.len(),
-                        "Partitioning strategy accepted with physical validation"
+                        "Partitioning strategy accepted"
                     );
                     return candidate;
                 }
-                tracing::warn!(
-                    priority = priority + 1,
+                tracing::debug!(
                     strategy = name,
-                    "Partition result rejected by physical reasonableness validator"
+                    priority = priority + 1,
+                    "Partition result rejected by physical validator"
                 );
             }
         }
