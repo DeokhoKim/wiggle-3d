@@ -590,7 +590,7 @@ fn stage_decode_and_roi(
 }
 
 /// Stage 2: Concurrent neural face/feature detection, descriptor matching, and sub-frame alignment.
-#[allow(clippy::cast_precision_loss)]
+#[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
 fn stage_vision_and_align(mut payload: VisionStagePayload) -> Result<AlignedStagePayload> {
     // Run Face Detection and SuperPoint Feature Extraction concurrently via rayon::join
     let (frame_faces, feature_frames_res) = rayon::join(
@@ -689,7 +689,9 @@ fn stage_vision_and_align(mut payload: VisionStagePayload) -> Result<AlignedStag
             );
     }
 
-    let aligned_frames = if !payload.sub_frame_crops.is_empty() {
+    let aligned_frames = if payload.sub_frame_crops.is_empty() {
+        None
+    } else {
         let scale_x = payload.dynamic_img.width() as f32 / payload.luma_image.width as f32;
         let scale_y = payload.dynamic_img.height() as f32 / payload.luma_image.height as f32;
         let scaled_shifts: Vec<(f32, f32)> = shifts
@@ -700,8 +702,6 @@ fn stage_vision_and_align(mut payload: VisionStagePayload) -> Result<AlignedStag
             &payload.sub_frame_crops,
             &scaled_shifts,
         )?)
-    } else {
-        None
     };
 
     payload.item.set_luma_image(payload.luma_image);
@@ -804,6 +804,7 @@ pub fn process_single_image(
 ///
 /// # Errors
 /// Returns [`Error::Io`] if output directory creation fails.
+#[allow(clippy::too_many_lines)]
 #[tracing::instrument(level = "debug", skip_all)]
 pub fn run_batch(request: &BatchProcessingRequest) -> Result<ProcessSummary> {
     if request.files.is_empty() {
