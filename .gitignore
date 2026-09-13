@@ -2,12 +2,14 @@
 # will have compiled files and executables
 debug/
 target/
+dist/
 
 # Remove Log files
 *.log
 
 # External dependencies
 /target/
+dist/
 /Cargo.lock
 
 # Backup files
