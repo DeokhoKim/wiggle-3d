@@ -6,6 +6,7 @@ set -eu
 
 REPO="${WIGGLE3D_REPO:-DeokhoKim/wiggle-3d}"
 INSTALL_DIR="${WIGGLE3D_INSTALL_DIR:-$HOME/.local/bin}"
+LIB_DIR="${WIGGLE3D_LIB_DIR:-$(dirname "$INSTALL_DIR")/lib}"
 VERSION="${WIGGLE3D_VERSION:-latest}"
 
 # Standardized ANSI Logging
@@ -38,6 +39,7 @@ case "$ACTION" in
             log_warn "Binary ${INSTALL_DIR}/reto-cli was not found."
         fi
 
+        rm -f "${LIB_DIR}"/libonnxruntime* 2>/dev/null || true
         rm -f "${INSTALL_DIR}"/libonnxruntime* 2>/dev/null || true
 
         CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/reto3d"
@@ -59,6 +61,7 @@ case "$ACTION" in
         printf "  --help, -h          Show this help message\n\n"
         printf "Environment Overrides:\n"
         printf "  WIGGLE3D_INSTALL_DIR  Target install directory (default: %s)\n" "$INSTALL_DIR"
+        printf "  WIGGLE3D_LIB_DIR      Target library directory (default: %s)\n" "$LIB_DIR"
         printf "  WIGGLE3D_VERSION      Target release version (default: %s)\n" "$VERSION"
         printf "  WIGGLE3D_REPO         GitHub repository (default: %s)\n" "$REPO"
         printf "  WIGGLE3D_CUDA         Force CUDA GPU runtime (1 or true)\n"
@@ -178,7 +181,7 @@ ONNX_VERSION="1.19.2"
 if ! "${INSTALL_DIR}/reto-cli" --help >/dev/null 2>&1; then
     log_warn "ONNX Runtime (v${ONNX_VERSION}) was not detected on your system."
     printf "  'reto-cli' requires ONNX Runtime dynamic libraries for neural vision alignment.\n"
-    printf "  Because RPATH is configured to \$ORIGIN, placing the libraries in '%s' satisfies this dependency.\n\n" "$INSTALL_DIR"
+    printf "  Because RPATH is configured to \$ORIGIN/../lib, placing the libraries in '%s' satisfies this dependency.\n\n" "$LIB_DIR"
 
     # Detect CUDA GPU availability
     HAS_CUDA=false
@@ -236,17 +239,18 @@ if ! "${INSTALL_DIR}/reto-cli" --help >/dev/null 2>&1; then
         log_info "Downloading ONNX Runtime v${ONNX_VERSION} from ${ORT_DOWNLOAD_URL}..."
         ORT_TMP="${TMP_DIR}/ort"
         mkdir -p "$ORT_TMP"
+        mkdir -p "$LIB_DIR"
         if curl -fSL --progress-bar "$ORT_DOWNLOAD_URL" -o "${TMP_DIR}/${ORT_TAR}"; then
             tar -xzf "${TMP_DIR}/${ORT_TAR}" -C "$ORT_TMP"
             case "$OS" in
                 Linux)
-                    cp -P "${ORT_TMP}"/onnxruntime-*/lib/libonnxruntime* "${INSTALL_DIR}/"
+                    cp -P "${ORT_TMP}"/onnxruntime-*/lib/libonnxruntime* "${LIB_DIR}/"
                     ;;
                 Darwin)
-                    cp -P "${ORT_TMP}"/onnxruntime-*/lib/libonnxruntime*.dylib "${INSTALL_DIR}/"
+                    cp -P "${ORT_TMP}"/onnxruntime-*/lib/libonnxruntime*.dylib "${LIB_DIR}/"
                     ;;
             esac
-            log_info "Successfully installed ONNX Runtime libraries to ${INSTALL_DIR}."
+            log_info "Successfully installed ONNX Runtime libraries to ${LIB_DIR}."
         else
             log_error "Failed to download ONNX Runtime."
         fi
@@ -254,12 +258,12 @@ if ! "${INSTALL_DIR}/reto-cli" --help >/dev/null 2>&1; then
         printf "\n  Manual Installation Command:\n"
         case "$OS" in
             Linux)
-                printf "    curl -fsSL \"%s\" | tar -xz -C /tmp && cp -P /tmp/onnxruntime-*/lib/libonnxruntime* \"%s/\" && rm -rf /tmp/onnxruntime-*\n\n" \
-                    "$ORT_DOWNLOAD_URL" "$INSTALL_DIR"
+                printf "    mkdir -p \"%s\" && curl -fsSL \"%s\" | tar -xz -C /tmp && cp -P /tmp/onnxruntime-*/lib/libonnxruntime* \"%s/\" && rm -rf /tmp/onnxruntime-*\n\n" \
+                    "$LIB_DIR" "$ORT_DOWNLOAD_URL" "$LIB_DIR"
                 ;;
             Darwin)
-                printf "    curl -fsSL \"%s\" | tar -xz -C /tmp && cp -P /tmp/onnxruntime-*/lib/libonnxruntime*.dylib \"%s/\" && rm -rf /tmp/onnxruntime-*\n\n" \
-                    "$ORT_DOWNLOAD_URL" "$INSTALL_DIR"
+                printf "    mkdir -p \"%s\" && curl -fsSL \"%s\" | tar -xz -C /tmp && cp -P /tmp/onnxruntime-*/lib/libonnxruntime*.dylib \"%s/\" && rm -rf /tmp/onnxruntime-*\n\n" \
+                    "$LIB_DIR" "$ORT_DOWNLOAD_URL" "$LIB_DIR"
                 ;;
         esac
     fi

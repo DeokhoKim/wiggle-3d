@@ -3,4 +3,7 @@ ORT_LIB_LOCATION = { value = ".cache_reto3d/onnxruntime/onnxruntime-linux-x64-gp
 ORT_PREFER_DYNAMIC_LINK = "1"
 
 [target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "link-arg=-Wl,-rpath,$ORIGIN"]
+rustflags = ["-C", "link-arg=-Wl,-rpath,$ORIGIN:$ORIGIN/../lib"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-Wl,-rpath,$ORIGIN:$ORIGIN/../lib"]
