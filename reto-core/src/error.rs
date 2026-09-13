@@ -1,4 +1,67 @@
+//! Error handling and Result types for reto-core.
+
 use thiserror::Error;
+
+/// Specific error conditions during Region of Interest (`RoI`) extraction and validation.
+#[derive(Error, Debug, Clone, PartialEq)]
+pub enum RoiError {
+    /// Invalid normalized coordinates.
+    #[error("Invalid normalized bounding box coordinates: x={x}, y={y}, w={width}, h={height}")]
+    InvalidBounds {
+        /// X coordinate in unit space.
+        x: f32,
+        /// Y coordinate in unit space.
+        y: f32,
+        /// Width in unit space.
+        width: f32,
+        /// Height in unit space.
+        height: f32,
+    },
+
+    /// Square image rejected.
+    #[error("Square images ({width}x{height}) are not supported: film strips must have aspect ratio != 1.0")]
+    SquareImageNotSupported {
+        /// Image width.
+        width: u32,
+        /// Image height.
+        height: u32,
+    },
+
+    /// Requested frame index is out of range.
+    #[error("Frame index {requested} is out of range (total frames detected: {available})")]
+    FrameIndexOutOfRange {
+        /// The requested frame index.
+        requested: usize,
+        /// Total number of available frames.
+        available: usize,
+    },
+
+    /// Detected frame count mismatch.
+    #[error("Detection failed: expected {expected} frames, but found {found}")]
+    MismatchedFrameCount {
+        /// Expected count of frames.
+        expected: usize,
+        /// Actually detected count of frames.
+        found: usize,
+    },
+
+    /// Film strip gutters could not be located.
+    #[error("Insufficient contrast or film gutters not found")]
+    GuttersNotFound,
+
+    /// Image is too small for processing.
+    #[error("Image dimensions ({width}x{height}) are too small for reliable RoI detection")]
+    ImageTooSmall {
+        /// Image width.
+        width: u32,
+        /// Image height.
+        height: u32,
+    },
+
+    /// Zero frames configured.
+    #[error("Expected frame count must be greater than zero, got {0}")]
+    ZeroExpectedFrames(usize),
+}
 
 /// Common error type for reto-core.
 #[derive(Debug, Error)]
@@ -7,9 +70,13 @@ pub enum Error {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// Splitting error.
-    #[error("Splitting error: {0}")]
-    Splitting(String),
+    /// `RoI` detection / geometry error wrapper.
+    #[error("RoI error: {0}")]
+    Roi(#[from] RoiError),
+
+    /// Image processing error wrapper.
+    #[error("Image error: {0}")]
+    Image(#[from] image::ImageError),
 
     /// Placeholder for other errors.
     #[error("Unknown error: {0}")]
@@ -33,8 +100,13 @@ mod tests {
     }
 
     #[test]
-    fn test_error_unknown() {
-        let error = Error::Unknown("test message".to_string());
-        assert_eq!(error.to_string(), "Unknown error: test message");
+    fn test_error_from_roi() {
+        let roi_err = RoiError::SquareImageNotSupported {
+            width: 100,
+            height: 100,
+        };
+        let error: Error = roi_err.into();
+        assert!(matches!(error, Error::Roi(_)));
+        assert!(error.to_string().contains("Square images"));
     }
 }
