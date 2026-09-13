@@ -454,9 +454,7 @@ fn match_features(
     Vec<crate::feature::FeatureTriplet>,
     Vec<(crate::feature::FramePair, Vec<crate::feature::FeatureMatch>)>,
 )> {
-    use crate::feature::{
-        FeatureMatcher, SuperPointDescriptorMatcher, TripletConsistencyConfig,
-    };
+    use crate::feature::{FeatureMatcher, SuperPointDescriptorMatcher, TripletConsistencyConfig};
 
     let mut extracted_triplets = Vec::new();
     let mut extracted_pairs = Vec::new();
@@ -468,12 +466,8 @@ fn match_features(
 
         let tap = match (overlay_path, roi_overlay) {
             (Some(path), Some(overlay)) => {
-                let t = crate::visualizer::SaveMatchesDiagnosticTap::new(
-                    Some(path),
-                    None,
-                    overlay,
-                )
-                .with_rois(rois.clone());
+                let t = crate::visualizer::SaveMatchesDiagnosticTap::new(Some(path), None, overlay)
+                    .with_rois(rois.clone());
                 t.add_faces(frame_faces);
                 for (idx, frame) in features.iter().enumerate() {
                     t.on_features_extracted(idx, frame);
@@ -605,23 +599,26 @@ fn stage_vision_and_align(mut payload: VisionStagePayload) -> Result<AlignedStag
                 Vec::new()
             } else {
                 match RetinaFaceDetector::default_engine() {
-                    Ok(face_detector) => match face_detector.detect_faces_for_rois(&payload.sub_frame_crops) {
-                        Ok(records) => {
-                            let total_faces: usize = records.iter().map(|(_, list, _)| list.len()).sum();
-                            if total_faces > 0 {
-                                tracing::debug!(
-                                    file = %payload.file_stem,
-                                    faces = total_faces,
-                                    "Detected faces across sub-frames"
-                                );
+                    Ok(face_detector) => {
+                        match face_detector.detect_faces_for_rois(&payload.sub_frame_crops) {
+                            Ok(records) => {
+                                let total_faces: usize =
+                                    records.iter().map(|(_, list, _)| list.len()).sum();
+                                if total_faces > 0 {
+                                    tracing::debug!(
+                                        file = %payload.file_stem,
+                                        faces = total_faces,
+                                        "Detected faces across sub-frames"
+                                    );
+                                }
+                                records
                             }
-                            records
+                            Err(e) => {
+                                tracing::warn!(file = %payload.file_stem, error = %e, "Failed to run face detection on sub-frames");
+                                Vec::new()
+                            }
                         }
-                        Err(e) => {
-                            tracing::warn!(file = %payload.file_stem, error = %e, "Failed to run face detection on sub-frames");
-                            Vec::new()
-                        }
-                    },
+                    }
                     Err(e) => {
                         tracing::warn!(file = %payload.file_stem, error = %e, "Failed to initialize RetinaFace detector");
                         Vec::new()
@@ -682,13 +679,14 @@ fn stage_vision_and_align(mut payload: VisionStagePayload) -> Result<AlignedStag
             crate::gif::DEFAULT_CLUSTER_TOLERANCE_PX,
         );
     } else if !pairs.is_empty() {
-        shifts = crate::gif::WiggleAligner::compute_depth_surface_shifts_from_pairs_with_face_priority(
-            &features,
-            &pairs,
-            dominant_face_bbox,
-            crate::gif::DEFAULT_DISPARITY_BIN_SIZE_PX,
-            crate::gif::DEFAULT_CLUSTER_TOLERANCE_PX,
-        );
+        shifts =
+            crate::gif::WiggleAligner::compute_depth_surface_shifts_from_pairs_with_face_priority(
+                &features,
+                &pairs,
+                dominant_face_bbox,
+                crate::gif::DEFAULT_DISPARITY_BIN_SIZE_PX,
+                crate::gif::DEFAULT_CLUSTER_TOLERANCE_PX,
+            );
     }
 
     let aligned_frames = if !payload.sub_frame_crops.is_empty() {
@@ -722,7 +720,9 @@ fn stage_vision_and_align(mut payload: VisionStagePayload) -> Result<AlignedStag
 /// Stage 3: In-memory NeuQuant color quantization and GIF byte stream encoding.
 fn stage_quantize_and_encode(mut payload: AlignedStagePayload) -> Result<EncodedStagePayload> {
     let gif_output = if let Some(ref aligned_frames) = payload.aligned_frames {
-        let gif_path = payload.output_dir.join(format!("{}_wiggle.gif", payload.file_stem));
+        let gif_path = payload
+            .output_dir
+            .join(format!("{}_wiggle.gif", payload.file_stem));
         let mut gif_bytes = Vec::new();
         crate::gif::WiggleGifBuilder::build_wiggle_gif(
             aligned_frames,
@@ -998,7 +998,8 @@ mod tests {
         assert!(output_path.join("sample_strip_wiggle.gif").exists());
 
         // Debug run: verify roi_overlay is saved when debug is enabled
-        let request_debug = BatchProcessingRequest::new(vec![input_path], output_path.clone(), true);
+        let request_debug =
+            BatchProcessingRequest::new(vec![input_path], output_path.clone(), true);
         let summary_debug = run_batch(&request_debug).expect("Debug batch should run");
         assert_eq!(summary_debug.successful_count, 1);
         assert!(output_path.join("sample_strip_roi_overlay.png").exists());
@@ -1031,10 +1032,12 @@ mod tests {
                     total,
                     success,
                 } => {
-                    self.completed
-                        .lock()
-                        .unwrap()
-                        .push((file_stem.to_string(), index, total, success));
+                    self.completed.lock().unwrap().push((
+                        file_stem.to_string(),
+                        index,
+                        total,
+                        success,
+                    ));
                 }
             }
         }
