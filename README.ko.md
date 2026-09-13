@@ -46,32 +46,47 @@
 
 ### 설치 방법
 
-```bash
-# 저장소 복제
-git clone https://github.com/DeokhoKim/wiggle-3d.git
-cd wiggle-3d
+#### 1-라인 자동 설치 (권장)
 
-# 최적화 릴리즈 바이너리 빌드
-cargo build --release
+```bash
+curl -fsSL https://raw.githubusercontent.com/DeokhoKim/wiggle-3d/main/install.sh | sh
 ```
 
-컴파일된 바이너리는 `target/release/reto-cli`에 생성됩니다.
+NVIDIA GPU (CUDA) 가속 사용 시:
+```bash
+curl -fsSL https://raw.githubusercontent.com/DeokhoKim/wiggle-3d/main/install.sh | WIGGLE3D_CUDA=1 sh
+```
+
+설치 스크립트는 최적화된 바이너리를 `~/.local/bin/reto-cli`에 설치하고, 필요한 ONNX Runtime 라이브러리를 `~/.local/lib/`에 자동 설정합니다.
+
+*삭제(Uninstall) 시:*
+```bash
+curl -fsSL https://raw.githubusercontent.com/DeokhoKim/wiggle-3d/main/install.sh | sh -s -- --uninstall
+```
+
+#### 소스 코드에서 직접 빌드 (개발자용)
+
+```bash
+git clone https://github.com/DeokhoKim/wiggle-3d.git
+cd wiggle-3d
+cargo build --release
+```
 
 ### 기본 사용법
 
 #### 단일 스캔 파일 처리
 ```bash
-./target/release/reto-cli --input samples/film_strip_01.jpg --output output_dir/
+reto-cli --input samples/film_strip_01.jpg --output output_dir/
 ```
 
 #### 디렉터리 내 전체 스캔 일괄 배치 처리
 ```bash
-./target/release/reto-cli --input /path/to/scans/ --output /path/to/results/
+reto-cli --input /path/to/scans/ --output /path/to/results/
 ```
 
 #### 디버그 시각화 및 상세 진단 로그 활성화
 ```bash
-./target/release/reto-cli --input samples/ --output results/ --debug -v
+reto-cli --input samples/ --output results/ --debug -v
 ```
 
 ---

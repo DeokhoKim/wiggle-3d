@@ -46,32 +46,47 @@ A raw 3-lens film scan (*left*) automatically partitioned, stabilized with sub-p
 
 ### Installation
 
-```bash
-# Clone the repository
-git clone https://github.com/DeokhoKim/wiggle-3d.git
-cd wiggle-3d
+#### 1-Line Standalone Installer (Recommended)
 
-# Build optimized release binary
-cargo build --release
+```bash
+curl -fsSL https://raw.githubusercontent.com/DeokhoKim/wiggle-3d/main/install.sh | sh
 ```
 
-The compiled binary will be located at `target/release/reto-cli`.
+For NVIDIA GPU acceleration (CUDA):
+```bash
+curl -fsSL https://raw.githubusercontent.com/DeokhoKim/wiggle-3d/main/install.sh | WIGGLE3D_CUDA=1 sh
+```
+
+The installer downloads the pre-built binary to `~/.local/bin/reto-cli` and automatically configures the required ONNX Runtime libraries in `~/.local/lib/`.
+
+*To uninstall:*
+```bash
+curl -fsSL https://raw.githubusercontent.com/DeokhoKim/wiggle-3d/main/install.sh | sh -s -- --uninstall
+```
+
+#### Build from Source (Developers)
+
+```bash
+git clone https://github.com/DeokhoKim/wiggle-3d.git
+cd wiggle-3d
+cargo build --release
+```
 
 ### Basic Usage
 
 #### Process a Single Scan File
 ```bash
-./target/release/reto-cli --input samples/film_strip_01.jpg --output output_dir/
+reto-cli --input samples/film_strip_01.jpg --output output_dir/
 ```
 
 #### Batch Process an Entire Directory
 ```bash
-./target/release/reto-cli --input /path/to/scans/ --output /path/to/results/
+reto-cli --input /path/to/scans/ --output /path/to/results/
 ```
 
 #### Run with Debug Visualizations and Diagnostic Logs
 ```bash
-./target/release/reto-cli --input samples/ --output results/ --debug -v
+reto-cli --input samples/ --output results/ --debug -v
 ```
 
 ---
