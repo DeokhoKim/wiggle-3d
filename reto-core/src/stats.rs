@@ -49,6 +49,7 @@ impl AxisPixelStats {
     /// ```
     #[must_use]
     #[inline]
+    #[allow(clippy::cast_possible_truncation)]
     pub fn from_samples(samples: &[u8]) -> Self {
         Self::from_iter(samples.iter().copied(), samples.len() as u32)
     }
@@ -56,6 +57,9 @@ impl AxisPixelStats {
     /// Constructs statistics from an arbitrary iterator of byte samples.
     ///
     /// Computes summary statistics in a single pass without heap allocating sample vectors.
+    ///
+    /// # Panics
+    /// Panics if `total_count` is zero.
     #[must_use]
     #[allow(
         clippy::cast_precision_loss,

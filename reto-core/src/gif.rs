@@ -198,6 +198,12 @@ struct HistogramClusteringResult {
 }
 
 impl HistogramClusteringResult {
+    #[allow(
+        clippy::too_many_lines,
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     fn compute<T, F>(
         items: &[T],
         get_inv_disp: F,
@@ -255,16 +261,16 @@ impl HistogramClusteringResult {
         let first_foreground_bin = populated_bins
             .iter()
             .copied()
-            .find(|b| bin_map.get(b).map_or(0, |v| v.len()) >= min_points_threshold);
+            .find(|b| bin_map.get(b).map_or(0, Vec::len) >= min_points_threshold);
 
         let target_bin = first_foreground_bin.map(|b_0| {
             let mut best_bin = b_0;
-            let mut best_count = bin_map.get(&b_0).map_or(0, |v| v.len());
+            let mut best_count = bin_map.get(&b_0).map_or(0, Vec::len);
             let mut curr_bin = b_0;
 
             loop {
                 let next_bin = curr_bin + 1;
-                let next_count = bin_map.get(&next_bin).map_or(0, |v| v.len());
+                let next_count = bin_map.get(&next_bin).map_or(0, Vec::len);
                 if next_count == 0 {
                     break;
                 }
@@ -294,7 +300,7 @@ impl HistogramClusteringResult {
                             .max_by_key(|(_, c)| {
                                 c.iter()
                                     .filter_map(|b| bin_map.get(b))
-                                    .map(|v| v.len())
+                                    .map(Vec::len)
                                     .sum::<usize>()
                             })
                             .map_or(0, |(i, _)| i)
@@ -308,7 +314,7 @@ impl HistogramClusteringResult {
                 .max_by_key(|(_, c)| {
                     c.iter()
                         .filter_map(|b| bin_map.get(b))
-                        .map(|v| v.len())
+                        .map(Vec::len)
                         .sum::<usize>()
                 })
                 .map_or(0, |(i, _)| i)
@@ -569,14 +575,13 @@ impl WiggleAligner {
             }
         }
 
-        let clustering = match HistogramClusteringResult::compute(
+        let Some(clustering) = HistogramClusteringResult::compute(
             &data,
             |item| item.inv_disp,
             effective_bin_size,
             effective_tolerance,
-        ) {
-            Some(res) => res,
-            None => return ([(0.0, 0.0), (0.0, 0.0), (0.0, 0.0)], empty_debug),
+        ) else {
+            return ([(0.0, 0.0), (0.0, 0.0), (0.0, 0.0)], empty_debug);
         };
 
         let bin_map = clustering.bin_map;
@@ -831,14 +836,13 @@ impl WiggleAligner {
                 }
             }
 
-            let clustering = match HistogramClusteringResult::compute(
+            let Some(clustering) = HistogramClusteringResult::compute(
                 &list,
                 |item| item.inv_disp,
                 effective_bin_size,
                 effective_tolerance,
-            ) {
-                Some(res) => res,
-                None => return (0.0, 0.0),
+            ) else {
+                return (0.0, 0.0);
             };
 
             let bin_map = clustering.bin_map;
