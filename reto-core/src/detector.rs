@@ -3,7 +3,7 @@
 use crate::error::RoiError;
 use crate::geom::{FrameRoi, FrameRoiSet, NormalizedRect, StripOrientation};
 use crate::luma::{
-    Bt709LumaConverter, ScaledGrayscaleStrip, DEFAULT_INVERSE_GAMMA, PROJECTION_MAX_DIMENSION,
+    Bt709LumaConverter, ScaledLumaImage, DEFAULT_INVERSE_GAMMA, PROJECTION_MAX_DIMENSION,
 };
 use crate::stats::AxisStatisticsProfile;
 use image::GenericImageView;
@@ -14,14 +14,25 @@ use serde::{Deserialize, Serialize};
 /// Allows external observers (debug loggers, UI visualizers, profilers) to intercept
 /// key pipeline stages during frame detection without modifying algorithm internals.
 pub trait RoiDiagnosticTap: Send + Sync {
-    /// Called when the scaled grayscale / luma representation is constructed during preprocessing.
-    fn on_grayscale_strip(&self, _strip: &ScaledGrayscaleStrip) {}
+    /// Called when the scaled luma representation is constructed during preprocessing.
+    fn on_luma_image(&self, _luma: &ScaledLumaImage) {}
 
-    /// Called when the 2D edge-preserving denoised grayscale strip is computed.
+    /// Backward-compatible event forwarder for [`RoiDiagnosticTap::on_luma_image`].
+    fn on_grayscale_strip(&self, luma: &ScaledLumaImage) {
+        self.on_luma_image(luma);
+    }
+
+    /// Called when the 2D edge-preserving denoised luma image is computed.
     ///
     /// *Note: Retained for optional developer debug visualization; not dispatched during standard pipeline execution.*
     #[allow(dead_code)]
-    fn on_denoised_strip(&self, _strip: &ScaledGrayscaleStrip) {}
+    fn on_denoised_luma(&self, _luma: &ScaledLumaImage) {}
+
+    /// Backward-compatible event forwarder for [`RoiDiagnosticTap::on_denoised_luma`].
+    #[allow(dead_code)]
+    fn on_denoised_strip(&self, luma: &ScaledLumaImage) {
+        self.on_denoised_luma(luma);
+    }
 
     /// Called when per-pixel statistics along the stacking axis are extracted.
     fn on_axis_statistics(&self, _stats: &AxisStatisticsProfile) {}
@@ -37,9 +48,6 @@ pub trait RoiDiagnosticTap: Send + Sync {
 }
 
 /// Zero-cost No-Op observer tap.
-///
-/// Implements [`RoiDiagnosticTap`] with empty methods, allowing zero-overhead execution
-/// when diagnostic logging is disabled.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoOpDiagnosticTap;
 
@@ -65,15 +73,15 @@ impl<'a> CompositeDiagnosticTap<'a> {
 }
 
 impl RoiDiagnosticTap for CompositeDiagnosticTap<'_> {
-    fn on_grayscale_strip(&self, strip: &ScaledGrayscaleStrip) {
+    fn on_luma_image(&self, luma: &ScaledLumaImage) {
         for tap in &self.taps {
-            tap.on_grayscale_strip(strip);
+            tap.on_luma_image(luma);
         }
     }
 
-    fn on_denoised_strip(&self, strip: &ScaledGrayscaleStrip) {
+    fn on_denoised_luma(&self, luma: &ScaledLumaImage) {
         for tap in &self.taps {
-            tap.on_denoised_strip(strip);
+            tap.on_denoised_luma(luma);
         }
     }
 
@@ -117,8 +125,8 @@ impl SaveLumaDiagnosticTap {
 }
 
 impl RoiDiagnosticTap for SaveLumaDiagnosticTap {
-    fn on_grayscale_strip(&self, strip: &ScaledGrayscaleStrip) {
-        let gray_img = strip.to_gray_image();
+    fn on_luma_image(&self, luma: &ScaledLumaImage) {
+        let gray_img = luma.to_gray_image();
         let _ = gray_img.save(&self.output_path);
     }
 }
@@ -142,8 +150,8 @@ impl SaveDenoisedLumaDiagnosticTap {
 }
 
 impl RoiDiagnosticTap for SaveDenoisedLumaDiagnosticTap {
-    fn on_denoised_strip(&self, strip: &ScaledGrayscaleStrip) {
-        let gray_img = strip.to_gray_image();
+    fn on_denoised_luma(&self, luma: &ScaledLumaImage) {
+        let gray_img = luma.to_gray_image();
         let _ = gray_img.save(&self.output_path);
     }
 }
@@ -171,17 +179,17 @@ impl Default for RoiDetectionConfig {
     fn default() -> Self {
         Self {
             expected_frames: 3,
-            min_frame_aspect_ratio: 0.60_f32,
-            max_frame_aspect_ratio: 0.90_f32,
+            min_frame_aspect_ratio: 0.4,
+            max_frame_aspect_ratio: 1.2,
         }
     }
 }
 
 impl RoiDetectionConfig {
-    /// Creates a configuration with an explicit frame count `expected_frames`.
+    /// Helper to construct detection options specifying expected frame count.
     ///
     /// # Arguments
-    /// * `expected_frames` - Number of frames expected in the scanned strip.
+    /// * `expected_frames` - Number of frames expected in the scanned image layout.
     ///
     /// # Examples
     /// ```
@@ -194,22 +202,49 @@ impl RoiDetectionConfig {
     pub const fn with_expected_frames(expected_frames: usize) -> Self {
         Self {
             expected_frames,
-            min_frame_aspect_ratio: 0.60_f32,
-            max_frame_aspect_ratio: 0.90_f32,
+            min_frame_aspect_ratio: 0.4,
+            max_frame_aspect_ratio: 1.2,
         }
     }
 }
 
 /// Core trait for `RoI` detection algorithms.
 pub trait RoiDetector: Send + Sync {
-    /// Detects `RoIs` within the given image buffer.
-    ///
-    /// If `diagnostic_tap` is `None`, diagnostic allocations are completely bypassed at zero runtime cost.
+    /// Detects sub-frame regions of interest directly from a pre-scaled luma image.
     ///
     /// # Arguments
-    /// * `image` - Source image view to scan for frame boundaries.
-    /// * `config` - Detection parameters such as expected frame count and aspect ratios.
-    /// * `diagnostic_tap` - Optional diagnostic event observer hook.
+    /// * `luma` - Pre-computed scaled luma image buffer.
+    /// * `config` - Detection parameters.
+    /// * `diagnostic_tap` - Optional diagnostic observer tap.
+    ///
+    /// # Errors
+    /// Returns [`RoiError`] if detection fails or configuration parameters are invalid.
+    fn detect_luma(
+        &self,
+        luma: &ScaledLumaImage,
+        config: &RoiDetectionConfig,
+        diagnostic_tap: Option<&dyn RoiDiagnosticTap>,
+    ) -> Result<FrameRoiSet, RoiError>;
+
+    /// Backward-compatible alias for [`RoiDetector::detect_luma`].
+    ///
+    /// # Errors
+    /// Returns [`RoiError`] if detection fails or configuration parameters are invalid.
+    fn detect_strip(
+        &self,
+        luma: &ScaledLumaImage,
+        config: &RoiDetectionConfig,
+        diagnostic_tap: Option<&dyn RoiDiagnosticTap>,
+    ) -> Result<FrameRoiSet, RoiError> {
+        self.detect_luma(luma, config, diagnostic_tap)
+    }
+
+    /// Detects sub-frame regions of interest on a generic image view by converting it to a luma image.
+    ///
+    /// # Arguments
+    /// * `image` - Source image view.
+    /// * `config` - Detection parameters.
+    /// * `diagnostic_tap` - Optional diagnostic observer tap.
     ///
     /// # Errors
     /// Returns [`RoiError`] if detection fails, image dimensions are invalid, or frame count is zero.
@@ -218,7 +253,14 @@ pub trait RoiDetector: Send + Sync {
         image: &I,
         config: &RoiDetectionConfig,
         diagnostic_tap: Option<&dyn RoiDiagnosticTap>,
-    ) -> Result<FrameRoiSet, RoiError>;
+    ) -> Result<FrameRoiSet, RoiError> {
+        let luma_img = ScaledLumaImage::from_image(
+            image,
+            &Bt709LumaConverter::new(),
+            PROJECTION_MAX_DIMENSION,
+        )?;
+        self.detect_luma(&luma_img, config, diagnostic_tap)
+    }
 }
 
 /// Simple baseline detector that divides the image into `N` equal segments along the stacking axis.
@@ -249,16 +291,15 @@ impl EvenSplitDetector {
 
 impl RoiDetector for EvenSplitDetector {
     #[allow(clippy::cast_precision_loss)]
-    fn detect<I: GenericImageView + Sync>(
+    fn detect_luma(
         &self,
-        image: &I,
+        luma: &ScaledLumaImage,
         config: &RoiDetectionConfig,
         diagnostic_tap: Option<&dyn RoiDiagnosticTap>,
     ) -> Result<FrameRoiSet, RoiError> {
-        let (width, height) = image.dimensions();
-        let orientation = StripOrientation::from_dimensions(width, height)?;
+        let size = luma.size();
+        let orientation = luma.orientation;
         let delegator = orientation.delegator();
-
         let n = config.expected_frames;
         if n == 0 {
             return Err(RoiError::ZeroExpectedFrames(0));
@@ -285,7 +326,7 @@ impl RoiDetector for EvenSplitDetector {
             });
         }
 
-        let roi_set = FrameRoiSet::new(width, height, orientation, frames);
+        let roi_set = FrameRoiSet::new(size.width, size.height, orientation, frames);
 
         if let Some(tap) = diagnostic_tap {
             tap.on_rois_detected(&roi_set);
@@ -329,14 +370,16 @@ impl RoiDetector for PillarStatsDetector {
         clippy::suboptimal_flops,
         clippy::too_many_lines
     )]
-    fn detect<I: GenericImageView + Sync>(
+    #[tracing::instrument(skip(self, luma, config, diagnostic_tap), level = "debug")]
+    fn detect_luma(
         &self,
-        image: &I,
+        luma: &ScaledLumaImage,
         config: &RoiDetectionConfig,
         diagnostic_tap: Option<&dyn RoiDiagnosticTap>,
     ) -> Result<FrameRoiSet, RoiError> {
-        let (width, height) = image.dimensions();
-        let orientation = StripOrientation::from_dimensions(width, height)?;
+        let width = luma.width;
+        let height = luma.height;
+        let orientation = luma.orientation;
         let delegator = orientation.delegator();
 
         let n = config.expected_frames;
@@ -344,27 +387,20 @@ impl RoiDetector for PillarStatsDetector {
             return Err(RoiError::ZeroExpectedFrames(0));
         }
 
-        // Convert input image to scaled grayscale strip using BT.709 luma converter
-        let luma_strip = ScaledGrayscaleStrip::from_image(
-            image,
-            &Bt709LumaConverter::new(),
-            PROJECTION_MAX_DIMENSION,
-        )?;
-
-        // Broadcast intermediate grayscale strip to diagnostic observer plugins
+        // Broadcast intermediate luma image to diagnostic observer plugins
         if let Some(tap) = diagnostic_tap {
-            tap.on_grayscale_strip(&luma_strip);
+            tap.on_luma_image(luma);
         }
 
         // Apply in-place 2D 3x3 branchless sorting network median denoising
-        let mut denoised_strip = luma_strip;
-        denoised_strip.median_filter_3x3();
+        let mut denoised_luma = luma.clone();
+        denoised_luma.median_filter_3x3();
 
-        // Perform baseline subtraction and linear contrast expansion on denoised strip using min_x(P5)
-        denoised_strip.inverse_gamma_stretch(DEFAULT_INVERSE_GAMMA);
+        // Perform baseline subtraction and linear contrast expansion on denoised luma using min_x(P5)
+        denoised_luma.inverse_gamma_stretch(DEFAULT_INVERSE_GAMMA);
 
         // Extract per-pixel cross-axis statistics from the denoised + gamma stretched luma image
-        let axis_stats = AxisStatisticsProfile::compute(&denoised_strip);
+        let axis_stats = AxisStatisticsProfile::compute(&denoised_luma);
 
         // Broadcast contrast spread projection profile to diagnostic taps
         let diff_profile: Vec<f32> = axis_stats
@@ -384,12 +420,12 @@ impl RoiDetector for PillarStatsDetector {
             let gutter_f32: Vec<f32> = partition
                 .gutter_centers
                 .iter()
-                .map(|&c| c as f32 / denoised_strip.major_len as f32)
+                .map(|&c| c as f32 / denoised_luma.major_len as f32)
                 .collect();
             tap.on_gutter_candidates(&gutter_f32);
         }
 
-        let total_major = denoised_strip.major_len as f32;
+        let total_major = denoised_luma.major_len as f32;
         let mut frames = Vec::with_capacity(n);
 
         for (i, &(f_start, f_len)) in partition.frame_spans.iter().enumerate() {
@@ -404,23 +440,20 @@ impl RoiDetector for PillarStatsDetector {
                 rect.height.clamp(0.0, 1.0),
             )?;
 
-            tracing::info!(
-                frame_index = i,
-                start_px = f_start,
-                length_px = f_len,
-                norm_start,
-                norm_len,
-                confidence = partition.confidence,
-                strategy = partition.strategy_name,
-                "Configured active frame RoI"
-            );
-
             frames.push(FrameRoi {
                 index: i,
                 bounds: validated_rect,
                 confidence: partition.confidence,
             });
         }
+
+        tracing::debug!(
+            strategy = partition.strategy_name,
+            confidence = format_args!("{:.2}", partition.confidence),
+            frame_count = frames.len(),
+            spans = ?partition.frame_spans,
+            "Configured active frame RoIs"
+        );
 
         let roi_set = FrameRoiSet::new(width, height, orientation, frames);
 
@@ -443,6 +476,7 @@ impl RoiDetector for PillarStatsDetector {
 )]
 mod tests {
     use super::*;
+    use crate::geom::Size2D;
     use image::{Rgba, RgbaImage};
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -482,7 +516,7 @@ mod tests {
         assert_eq!(f0.bounds.y, 0.0);
         assert_eq!(f0.bounds.height, 1.0);
 
-        let px0 = f0.bounds.to_pixel_rect(300, 100);
+        let px0 = f0.bounds.to_pixel_rect(Size2D::new(300, 100));
         assert_eq!(px0.x, 0);
         assert_eq!(px0.width, 100);
         assert_eq!(px0.y, 0);
@@ -491,14 +525,14 @@ mod tests {
         // Frame 1: x in [1/3, 2/3]
         let f1 = &result.frames[1];
         assert_eq!(f1.index, 1);
-        let px1 = f1.bounds.to_pixel_rect(300, 100);
+        let px1 = f1.bounds.to_pixel_rect(Size2D::new(300, 100));
         assert_eq!(px1.x, 100);
         assert_eq!(px1.width, 100);
 
         // Frame 2: x in [2/3, 1.0]
         let f2 = &result.frames[2];
         assert_eq!(f2.index, 2);
-        let px2 = f2.bounds.to_pixel_rect(300, 100);
+        let px2 = f2.bounds.to_pixel_rect(Size2D::new(300, 100));
         assert_eq!(px2.x, 200);
         assert_eq!(px2.width, 100);
 
@@ -532,7 +566,7 @@ mod tests {
             assert!((frame.bounds.y - (i as f32 * 0.25)).abs() < 1e-6);
             assert!((frame.bounds.height - 0.25).abs() < 1e-6);
 
-            let px = frame.bounds.to_pixel_rect(100, 400);
+            let px = frame.bounds.to_pixel_rect(Size2D::new(100, 400));
             assert_eq!(px.x, 0);
             assert_eq!(px.width, 100);
             assert_eq!(px.y, i as u32 * 100);

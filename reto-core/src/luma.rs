@@ -3,6 +3,7 @@
 use crate::error::RoiError;
 use crate::geom::StripOrientation;
 use image::{GenericImageView, Pixel};
+use ndarray::{self, arr1, Array1, ArrayView2, Axis};
 use num_traits::ToPrimitive;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -21,39 +22,81 @@ pub const DEFAULT_PROFILE_PERCENTILE: f32 = 0.01;
 
 /// Interface contract for converting RGB color components to scalar luma / grayscale intensity.
 pub trait LumaConverter: Send + Sync {
-    /// Converts 8-bit RGB color channels to a scalar 8-bit luma intensity in `[0, 255]`.
+    /// 3-element channel linear weight vector `[W_r, W_g, W_b]` for matrix / dot product computations.
+    fn weights(&self) -> [f32; 3];
+
+    /// Converts 8-bit RGB color channels to a scalar 8-bit luma intensity in `[0, 255]` via dot product.
     ///
     /// # Arguments
     /// * `r` - Red channel `[0, 255]`.
     /// * `g` - Green channel `[0, 255]`.
     /// * `b` - Blue channel `[0, 255]`.
-    fn rgb_to_luma(&self, r: u8, g: u8, b: u8) -> u8;
+    #[inline]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::suboptimal_flops
+    )]
+    fn rgb_to_luma(&self, r: u8, g: u8, b: u8) -> u8 {
+        let w = self.weights();
+        (w[0] * f32::from(r) + w[1] * f32::from(g) + w[2] * f32::from(b))
+            .round()
+            .clamp(0.0, 255.0) as u8
+    }
+
+    /// Vectorized conversion of an `[N, 3]` RGB float tensor to a 1D `[N]` luma tensor using matrix-vector multiplication ($Y = X \cdot W$).
+    #[must_use]
+    fn convert_rgb_tensor(&self, rgb_matrix: &ArrayView2<f32>) -> Array1<f32> {
+        let weights = arr1(&self.weights());
+        rgb_matrix.dot(&weights)
+    }
 
     /// Vectorized conversion of packed 24-bit RGB pixel buffers into a scalar 8-bit luma slice.
-    ///
-    /// Processes contiguous chunks in an auto-vectorized loop.
     ///
     /// # Arguments
     /// * `rgb` - Interleaved 8-bit RGB bytes (length must be multiple of 3).
     /// * `out_luma` - Output buffer destination.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn convert_rgb_slice(&self, rgb: &[u8], out_luma: &mut [u8]) {
         let count = (rgb.len() / 3).min(out_luma.len());
-        for (chunk, out) in rgb.chunks_exact(3).take(count).zip(out_luma.iter_mut()) {
-            *out = self.rgb_to_luma(chunk[0], chunk[1], chunk[2]);
+        if count == 0 {
+            return;
+        }
+        if let Ok(src_view) = ArrayView2::<'_, u8>::from_shape((count, 3), &rgb[..count * 3]) {
+            let weights = arr1(&self.weights());
+            let luma_f32 = src_view.mapv(f32::from).dot(&weights);
+            for (out, &y) in out_luma[..count].iter_mut().zip(luma_f32.iter()) {
+                *out = y.round().clamp(0.0, 255.0) as u8;
+            }
         }
     }
 
     /// Vectorized conversion of packed 32-bit RGBA pixel buffers into a scalar 8-bit luma slice.
     ///
-    /// Processes contiguous chunks in an auto-vectorized loop.
-    ///
     /// # Arguments
     /// * `rgba` - Interleaved 8-bit RGBA bytes (length must be multiple of 4).
     /// * `out_luma` - Output buffer destination.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::suboptimal_flops
+    )]
     fn convert_rgba_slice(&self, rgba: &[u8], out_luma: &mut [u8]) {
         let count = (rgba.len() / 4).min(out_luma.len());
-        for (chunk, out) in rgba.chunks_exact(4).take(count).zip(out_luma.iter_mut()) {
-            *out = self.rgb_to_luma(chunk[0], chunk[1], chunk[2]);
+        if count == 0 {
+            return;
+        }
+        if let Ok(src_view) = ArrayView2::<'_, u8>::from_shape((count, 4), &rgba[..count * 4]) {
+            let w = self.weights();
+            for (out, row) in out_luma[..count]
+                .iter_mut()
+                .zip(src_view.axis_iter(Axis(0)))
+            {
+                let r = f32::from(row[0]);
+                let g = f32::from(row[1]);
+                let b = f32::from(row[2]);
+                *out = (w[0] * r + w[1] * g + w[2] * b).round().clamp(0.0, 255.0) as u8;
+            }
         }
     }
 }
@@ -82,39 +125,12 @@ impl SimpleGrayConverter {
 
 impl LumaConverter for SimpleGrayConverter {
     #[inline]
-    #[allow(clippy::cast_possible_truncation)]
-    fn rgb_to_luma(&self, r: u8, g: u8, b: u8) -> u8 {
-        ((u32::from(r) + u32::from(g) + u32::from(b)) / 3) as u8
-    }
-
-    #[inline]
-    #[allow(clippy::cast_possible_truncation)]
-    fn convert_rgb_slice(&self, rgb: &[u8], out_luma: &mut [u8]) {
-        let count = (rgb.len() / 3).min(out_luma.len());
-        let src = &rgb[..count * 3];
-        let dst = &mut out_luma[..count];
-        for (chunk, out) in src.chunks_exact(3).zip(dst.iter_mut()) {
-            *out = ((u32::from(chunk[0]) + u32::from(chunk[1]) + u32::from(chunk[2])) / 3) as u8;
-        }
-    }
-
-    #[inline]
-    #[allow(clippy::cast_possible_truncation)]
-    fn convert_rgba_slice(&self, rgba: &[u8], out_luma: &mut [u8]) {
-        let count = (rgba.len() / 4).min(out_luma.len());
-        let src = &rgba[..count * 4];
-        let dst = &mut out_luma[..count];
-        for (chunk, out) in src.chunks_exact(4).zip(dst.iter_mut()) {
-            *out = ((u32::from(chunk[0]) + u32::from(chunk[1]) + u32::from(chunk[2])) / 3) as u8;
-        }
+    fn weights(&self) -> [f32; 3] {
+        [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]
     }
 }
 
 /// ITU-R BT.709 high-definition luma converter: $Y = 0.2126 R + 0.7152 G + 0.0722 B$.
-///
-/// Uses 16-bit integer fixed-point math for optimal performance on SIMD architectures:
-///
-/// $$Y = \lfloor (13933 \cdot R + 46871 \cdot G + 4728 \cdot B + 32768) \gg 16 \rfloor$$
 ///
 /// # Examples
 /// ```
@@ -127,6 +143,9 @@ impl LumaConverter for SimpleGrayConverter {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bt709LumaConverter;
 
+/// ITU-R BT.709 linear weights for RGB components `[R=0.2126, G=0.7152, B=0.0722]`.
+pub const BT709_RGB_WEIGHTS: [f32; 3] = [0.2126, 0.7152, 0.0722];
+
 impl Bt709LumaConverter {
     /// Creates a new `Bt709LumaConverter`.
     #[must_use]
@@ -137,52 +156,17 @@ impl Bt709LumaConverter {
 
 impl LumaConverter for Bt709LumaConverter {
     #[inline]
-    fn rgb_to_luma(&self, r: u8, g: u8, b: u8) -> u8 {
-        let y = (13933_u32 * u32::from(r)
-            + 46871_u32 * u32::from(g)
-            + 4728_u32 * u32::from(b)
-            + 32768_u32)
-            >> 16;
-        y.min(255) as u8
-    }
-
-    #[inline]
-    fn convert_rgb_slice(&self, rgb: &[u8], out_luma: &mut [u8]) {
-        let count = (rgb.len() / 3).min(out_luma.len());
-        let src = &rgb[..count * 3];
-        let dst = &mut out_luma[..count];
-        for (chunk, out) in src.chunks_exact(3).zip(dst.iter_mut()) {
-            let y = (13933_u32 * u32::from(chunk[0])
-                + 46871_u32 * u32::from(chunk[1])
-                + 4728_u32 * u32::from(chunk[2])
-                + 32768_u32)
-                >> 16;
-            *out = y.min(255) as u8;
-        }
-    }
-
-    #[inline]
-    fn convert_rgba_slice(&self, rgba: &[u8], out_luma: &mut [u8]) {
-        let count = (rgba.len() / 4).min(out_luma.len());
-        let src = &rgba[..count * 4];
-        let dst = &mut out_luma[..count];
-        for (chunk, out) in src.chunks_exact(4).zip(dst.iter_mut()) {
-            let y = (13933_u32 * u32::from(chunk[0])
-                + 46871_u32 * u32::from(chunk[1])
-                + 4728_u32 * u32::from(chunk[2])
-                + 32768_u32)
-                >> 16;
-            *out = y.min(255) as u8;
-        }
+    fn weights(&self) -> [f32; 3] {
+        BT709_RGB_WEIGHTS
     }
 }
 
-/// Scaled grayscale representation of a film strip scan oriented along its stacking axis.
+/// Scaled single-channel 8-bit luma representation of an image oriented along its major stacking axis.
 ///
 /// Uses [`crate::geom::OrientationDelegator`] for all coordinate mapping and axis operations,
-/// guaranteeing complete orientation-agnostic behavior for both horizontal and vertical scans.
+/// guaranteeing complete orientation-agnostic behavior for both horizontal and vertical layouts.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScaledGrayscaleStrip {
+pub struct ScaledLumaImage {
     /// 1D contiguous pixel buffer of size `major_len * minor_len`.
     pub buffer: Vec<u8>,
     /// Number of pixels along major stacking dimension.
@@ -193,14 +177,17 @@ pub struct ScaledGrayscaleStrip {
     pub width: u32,
     /// Total height of the scaled 2D image in pixels.
     pub height: u32,
-    /// Orientation of the film strip scan.
+    /// Orientation of the image layout.
     pub orientation: StripOrientation,
     /// Applied scaling factor relative to the original image dimensions.
     pub scale_factor_bits: u32,
 }
 
-impl ScaledGrayscaleStrip {
-    /// Converts and optionally downscales an input image view into a scaled grayscale representation.
+/// Backward-compatible alias for [`ScaledLumaImage`].
+pub type ScaledGrayscaleStrip = ScaledLumaImage;
+
+impl ScaledLumaImage {
+    /// Converts and optionally downscales an input image view into a scaled luma representation.
     ///
     /// The major axis is clamped to `max_dimension` (e.g. [`PROJECTION_MAX_DIMENSION`]), preserving aspect ratio.
     /// All pixel lookups follow the delegation pattern via [`crate::geom::OrientationDelegator::to_xy`].
@@ -217,14 +204,14 @@ impl ScaledGrayscaleStrip {
     ///
     /// # Examples
     /// ```
-    /// use reto_core::{Bt709LumaConverter, ScaledGrayscaleStrip, PROJECTION_MAX_DIMENSION};
+    /// use reto_core::{Bt709LumaConverter, ScaledLumaImage, PROJECTION_MAX_DIMENSION};
     /// use image::{Rgba, RgbaImage};
     ///
     /// let img = RgbaImage::from_pixel(300, 100, Rgba([200, 200, 200, 255]));
     /// let converter = Bt709LumaConverter::new();
-    /// let strip = ScaledGrayscaleStrip::from_image(&img, &converter, PROJECTION_MAX_DIMENSION).unwrap();
-    /// assert_eq!(strip.major_len, 300);
-    /// assert_eq!(strip.minor_len, 100);
+    /// let luma = ScaledLumaImage::from_image(&img, &converter, PROJECTION_MAX_DIMENSION).unwrap();
+    /// assert_eq!(luma.major_len, 300);
+    /// assert_eq!(luma.minor_len, 100);
     /// ```
     #[allow(
         clippy::cast_precision_loss,
@@ -232,17 +219,19 @@ impl ScaledGrayscaleStrip {
         clippy::cast_sign_loss,
         clippy::many_single_char_names
     )]
+    #[tracing::instrument(skip(image, converter), level = "debug")]
     pub fn from_image<I: GenericImageView + Sync, C: LumaConverter>(
         image: &I,
         converter: &C,
         max_dimension: u32,
     ) -> Result<Self, RoiError> {
         let (orig_w, orig_h) = image.dimensions();
-        let orientation = StripOrientation::from_dimensions(orig_w, orig_h)?;
+        let orig_size = crate::geom::Size2D::new(orig_w, orig_h);
+        let orientation = StripOrientation::from_size(orig_size)?;
         let delegator = orientation.delegator();
 
-        let orig_major = delegator.major_dimension(orig_w, orig_h);
-        let orig_minor = delegator.minor_dimension(orig_w, orig_h);
+        let orig_major = delegator.major_dimension(orig_size);
+        let orig_minor = delegator.minor_dimension(orig_size);
 
         let scale_factor = if orig_minor > max_dimension {
             max_dimension as f32 / orig_minor as f32
@@ -395,6 +384,13 @@ impl ScaledGrayscaleStrip {
             });
     }
 
+    /// Returns the buffer dimensions as a structured `Size2D<u32>`.
+    #[inline]
+    #[must_use]
+    pub const fn size(&self) -> crate::geom::Size2D<u32> {
+        crate::geom::Size2D::new(self.width, self.height)
+    }
+
     /// Extracts the percentile intensity along the perpendicular slice at `major_idx`
     /// using orientation-delegated stride indexing over pre-computed dimensions.
     #[must_use]
@@ -412,7 +408,7 @@ impl ScaledGrayscaleStrip {
         let (start, stride) = self
             .orientation
             .delegator()
-            .slice_stride(major_idx, self.width, self.height);
+            .slice_stride(major_idx, self.size());
 
         let target_rank = ((minor_len as f32 * percentile.clamp(0.0, 1.0)).round() as u32)
             .min(minor_len.saturating_sub(1));
@@ -685,5 +681,15 @@ mod tests {
         assert_eq!(strip.get_xy(5, 5), 0);
         // Max pixel (220) should stretch higher
         assert!(strip.get_xy(90, 40) > 150);
+    }
+
+    #[test]
+    fn test_bt709_tensor_dot() {
+        let rgb_data = vec![1.0_f32, 1.0, 1.0, 1.0, 0.0, 0.0];
+        let rgb_mat = ArrayView2::from_shape((2, 3), &rgb_data).expect("valid shape");
+        let conv = Bt709LumaConverter::new();
+        let luma = conv.convert_rgb_tensor(&rgb_mat);
+        assert!((luma[0] - 1.0).abs() < 1e-4);
+        assert!((luma[1] - 0.2126).abs() < 1e-4);
     }
 }

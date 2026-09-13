@@ -1,7 +1,7 @@
 //! Per-pixel statistical extraction along film strip stacking axes.
 
 use crate::geom::StripOrientation;
-use crate::luma::ScaledGrayscaleStrip;
+use crate::luma::ScaledLumaImage;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -132,30 +132,30 @@ impl AxisStatisticsProfile {
     /// and parallelizes computation across all CPU cores via Rayon.
     ///
     /// # Arguments
-    /// * `strip` - Scaled grayscale strip scan.
+    /// * `luma` - Scaled luma image.
     ///
     /// # Examples
     /// ```
-    /// use reto_core::{Bt709LumaConverter, ScaledGrayscaleStrip, AxisStatisticsProfile, PROJECTION_MAX_DIMENSION};
+    /// use reto_core::{Bt709LumaConverter, ScaledLumaImage, AxisStatisticsProfile, PROJECTION_MAX_DIMENSION};
     /// use image::{Rgba, RgbaImage};
     ///
     /// let img = RgbaImage::from_pixel(300, 100, Rgba([120, 120, 120, 255]));
-    /// let strip = ScaledGrayscaleStrip::from_image(&img, &Bt709LumaConverter::new(), PROJECTION_MAX_DIMENSION).unwrap();
-    /// let profile = AxisStatisticsProfile::compute(&strip);
+    /// let luma = ScaledLumaImage::from_image(&img, &Bt709LumaConverter::new(), PROJECTION_MAX_DIMENSION).unwrap();
+    /// let profile = AxisStatisticsProfile::compute(&luma);
     /// assert_eq!(profile.len(), 300);
     /// assert_eq!(profile.stats[0].min, 120);
     /// ```
     #[must_use]
-    pub fn compute(strip: &ScaledGrayscaleStrip) -> Self {
-        let major_len = strip.major_len;
-        let minor_len = strip.minor_len;
+    pub fn compute(luma: &ScaledLumaImage) -> Self {
+        let major_len = luma.major_len;
+        let minor_len = luma.minor_len;
 
         let stats: Vec<AxisPixelStats> = (0..major_len)
             .into_par_iter()
             .map(|major| {
                 let mut samples = Vec::with_capacity(minor_len as usize);
                 for cross in 0..minor_len {
-                    samples.push(strip.get(major, cross));
+                    samples.push(luma.get(major, cross));
                 }
                 AxisPixelStats::from_samples(&samples)
             })
@@ -164,7 +164,7 @@ impl AxisStatisticsProfile {
         Self {
             stats,
             sample_count: minor_len,
-            orientation: strip.orientation,
+            orientation: luma.orientation,
         }
     }
 
@@ -680,8 +680,7 @@ mod tests {
         }
 
         let conv = Bt709LumaConverter::new();
-        let strip =
-            ScaledGrayscaleStrip::from_image(&img, &conv, PROJECTION_MAX_DIMENSION).unwrap();
+        let strip = ScaledLumaImage::from_image(&img, &conv, PROJECTION_MAX_DIMENSION).unwrap();
         let profile = AxisStatisticsProfile::compute(&strip);
 
         assert_eq!(profile.len(), 300);
@@ -707,8 +706,7 @@ mod tests {
         }
 
         let conv = SimpleGrayConverter::new();
-        let strip =
-            ScaledGrayscaleStrip::from_image(&img, &conv, PROJECTION_MAX_DIMENSION).unwrap();
+        let strip = ScaledLumaImage::from_image(&img, &conv, PROJECTION_MAX_DIMENSION).unwrap();
         let profile = AxisStatisticsProfile::compute(&strip);
 
         assert_eq!(profile.len(), 300);
@@ -760,8 +758,7 @@ mod tests {
         }
 
         let conv = SimpleGrayConverter::new();
-        let strip =
-            ScaledGrayscaleStrip::from_image(&img, &conv, PROJECTION_MAX_DIMENSION).unwrap();
+        let strip = ScaledLumaImage::from_image(&img, &conv, PROJECTION_MAX_DIMENSION).unwrap();
         let profile = AxisStatisticsProfile::compute(&strip);
 
         let grid = profile
@@ -790,8 +787,7 @@ mod tests {
         }
 
         let conv = SimpleGrayConverter::new();
-        let strip =
-            ScaledGrayscaleStrip::from_image(&img, &conv, PROJECTION_MAX_DIMENSION).unwrap();
+        let strip = ScaledLumaImage::from_image(&img, &conv, PROJECTION_MAX_DIMENSION).unwrap();
         let profile = AxisStatisticsProfile::compute(&strip);
 
         let partition = profile
