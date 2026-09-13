@@ -103,6 +103,7 @@ struct IndicatifObserver {
 }
 
 impl IndicatifObserver {
+    #[inline]
     const fn new(pb: ProgressBar) -> Self {
         Self { pb }
     }
@@ -122,6 +123,8 @@ impl ProgressObserver for IndicatifObserver {
 }
 
 /// Non-interactive line-based progress observer for CI/CD and piped streams.
+const PROGRESS_STEP_PCT: usize = 25;
+
 #[derive(Debug)]
 struct NonTtyProgressObserver {
     completed_count: AtomicUsize,
@@ -129,6 +132,7 @@ struct NonTtyProgressObserver {
 }
 
 impl NonTtyProgressObserver {
+    #[inline]
     const fn new() -> Self {
         Self {
             completed_count: AtomicUsize::new(0),
@@ -140,11 +144,11 @@ impl NonTtyProgressObserver {
 impl ProgressObserver for NonTtyProgressObserver {
     fn on_progress(&self, event: ProgressEvent<'_>) {
         if let ProgressEvent::ItemCompleted { total, .. } = event {
-            let done = self.completed_count.fetch_add(1, Ordering::SeqCst) + 1;
+            let done = self.completed_count.fetch_add(1, Ordering::Relaxed) + 1;
             let pct = (done * 100) / total.max(1);
-            let last = self.last_logged_pct.load(Ordering::SeqCst);
-            if pct >= last + 25 || done == total {
-                self.last_logged_pct.store((pct / 25) * 25, Ordering::SeqCst);
+            let last = self.last_logged_pct.load(Ordering::Relaxed);
+            if pct >= last + PROGRESS_STEP_PCT || done == total {
+                self.last_logged_pct.store((pct / PROGRESS_STEP_PCT) * PROGRESS_STEP_PCT, Ordering::Relaxed);
                 tracing::info!("Progress: {}/{} ({}%) completed", done, total, pct);
             }
         }
@@ -246,12 +250,13 @@ fn main() -> anyhow::Result<()> {
         "Verified input files for processing"
     );
 
+    let total_files = files.len();
     let gif_config = reto_core::WiggleGifConfig::new(cli.gif_delay).with_dither(!cli.no_dither);
-    let mut request = BatchProcessingRequest::new(files.clone(), cli.output.clone(), cli.debug)
+    let mut request = BatchProcessingRequest::new(files, cli.output.clone(), cli.debug)
         .with_gif_config(gif_config);
 
     let progress_bar = if is_tty {
-        let pb = ProgressBar::new(files.len() as u64);
+        let pb = ProgressBar::new(total_files as u64);
         pb.set_draw_target(indicatif::ProgressDrawTarget::stderr_with_hz(20));
         let style = ProgressStyle::default_bar()
             .template("{spinner:.green} [{elapsed_precise}] [{bar:24.cyan/blue}] {pos}/{len} ({percent}%) ETA: {eta} | {wide_msg}")
@@ -280,23 +285,14 @@ fn main() -> anyhow::Result<()> {
     }
 
     if !cli.quiet {
-        if is_tty {
-            println!(
-                "✔ [OK] Processed {} images ({} succeeded, {} failed) in {:.1}s.",
-                summary.total_input,
-                summary.successful_count,
-                summary.failed_count,
-                elapsed.as_secs_f64()
-            );
-        } else {
-            println!(
-                "[OK] Processed {} images ({} succeeded, {} failed) in {:.1}s.",
-                summary.total_input,
-                summary.successful_count,
-                summary.failed_count,
-                elapsed.as_secs_f64()
-            );
-        }
+        let prefix = if is_tty { "✔ [OK]" } else { "[OK]" };
+        println!(
+            "{prefix} Processed {} images ({} succeeded, {} failed) in {:.1}s.",
+            summary.total_input,
+            summary.successful_count,
+            summary.failed_count,
+            elapsed.as_secs_f64()
+        );
         println!("  • Output Directory: {}", cli.output.display());
         if let Some(ref log_file) = actual_log_file {
             println!("  • Execution Log:    {}", log_file.display());

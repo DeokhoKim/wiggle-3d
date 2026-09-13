@@ -3,7 +3,7 @@
 use crate::error::RoiError;
 use crate::geom::StripOrientation;
 use image::{GenericImageView, Pixel};
-use ndarray::{self, arr1, Array1, ArrayView2, Axis};
+use ndarray::{self, arr1, Array1, ArrayView2};
 use num_traits::ToPrimitive;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -56,18 +56,22 @@ pub trait LumaConverter: Send + Sync {
     /// # Arguments
     /// * `rgb` - Interleaved 8-bit RGB bytes (length must be multiple of 3).
     /// * `out_luma` - Output buffer destination.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::suboptimal_flops
+    )]
     fn convert_rgb_slice(&self, rgb: &[u8], out_luma: &mut [u8]) {
         let count = (rgb.len() / 3).min(out_luma.len());
         if count == 0 {
             return;
         }
-        if let Ok(src_view) = ArrayView2::<'_, u8>::from_shape((count, 3), &rgb[..count * 3]) {
-            let weights = arr1(&self.weights());
-            let luma_f32 = src_view.mapv(f32::from).dot(&weights);
-            for (out, &y) in out_luma[..count].iter_mut().zip(luma_f32.iter()) {
-                *out = y.round().clamp(0.0, 255.0) as u8;
-            }
+        let [wr, wg, wb] = self.weights();
+        for (out, chunk) in out_luma[..count].iter_mut().zip(rgb.chunks_exact(3)) {
+            let r = f32::from(chunk[0]);
+            let g = f32::from(chunk[1]);
+            let b = f32::from(chunk[2]);
+            *out = (wr * r + wg * g + wb * b).round().clamp(0.0, 255.0) as u8;
         }
     }
 
@@ -86,17 +90,12 @@ pub trait LumaConverter: Send + Sync {
         if count == 0 {
             return;
         }
-        if let Ok(src_view) = ArrayView2::<'_, u8>::from_shape((count, 4), &rgba[..count * 4]) {
-            let w = self.weights();
-            for (out, row) in out_luma[..count]
-                .iter_mut()
-                .zip(src_view.axis_iter(Axis(0)))
-            {
-                let r = f32::from(row[0]);
-                let g = f32::from(row[1]);
-                let b = f32::from(row[2]);
-                *out = (w[0] * r + w[1] * g + w[2] * b).round().clamp(0.0, 255.0) as u8;
-            }
+        let [wr, wg, wb] = self.weights();
+        for (out, chunk) in out_luma[..count].iter_mut().zip(rgba.chunks_exact(4)) {
+            let r = f32::from(chunk[0]);
+            let g = f32::from(chunk[1]);
+            let b = f32::from(chunk[2]);
+            *out = (wr * r + wg * g + wb * b).round().clamp(0.0, 255.0) as u8;
         }
     }
 }

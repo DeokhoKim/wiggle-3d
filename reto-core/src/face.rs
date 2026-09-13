@@ -524,12 +524,12 @@ impl RetinaFaceDetector {
             if suppressed[i] {
                 continue;
             }
-            let current = candidates[i].clone();
-            kept.push(current.clone());
+            let current_bbox = candidates[i].bbox;
+            kept.push(candidates[i].clone());
 
             for j in (i + 1)..candidates.len() {
                 if !suppressed[j]
-                    && Self::calculate_iou(current.bbox, candidates[j].bbox) > iou_thresh
+                    && Self::calculate_iou(current_bbox, candidates[j].bbox) > iou_thresh
                 {
                     suppressed[j] = true;
                 }
