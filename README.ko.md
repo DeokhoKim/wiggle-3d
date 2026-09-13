@@ -21,9 +21,13 @@
 
 ## 샘플 결과 (Sample)
 
-| 3구 렌즈 필름 스캔 스트립 | Wiggle 3D |
-| :---: | :---: |
-| <img src="assets/sample_scan.jpg" alt="3구 렌즈 필름 스캔 스트립" width="560" /> | <img src="assets/sample_wiggle.gif" alt="Wiggle 3D" width="190" /> |
+원본 3구 렌즈 필름 스캔 스트립(좌측)을 자동으로 분할하고 인물 초점 고정 및 정밀 정렬을 거쳐 합성된 3D 입체 루프 애니메이션(우측)입니다:
+
+<p align="center">
+  <img src="assets/sample_scan.jpg" alt="3구 렌즈 필름 스캔 스트립" width="560" />
+  &nbsp;&nbsp;
+  <img src="assets/sample_wiggle.gif" alt="Wiggle 3D 입체 루프" width="179" />
+</p>
 
 ---
 
