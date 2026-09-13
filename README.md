@@ -23,7 +23,7 @@ To produce a natural stereoscopic "wiggle" animation:
 
 | Raw 3-Lens Film Strip Scan | Wiggle 3D |
 | :---: | :---: |
-| <img src="assets/sample_scan.jpg" alt="Raw 3-Lens Film Strip Scan" height="280" /> | <img src="assets/sample_wiggle.gif" alt="Wiggle 3D" height="280" /> |
+| <img src="assets/sample_scan.jpg" alt="Raw 3-Lens Film Strip Scan" width="560" /> | <img src="assets/sample_wiggle.gif" alt="Wiggle 3D" width="190" /> |
 
 ---
 

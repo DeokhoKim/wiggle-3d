@@ -23,7 +23,7 @@
 
 | 3구 렌즈 필름 스캔 스트립 | Wiggle 3D |
 | :---: | :---: |
-| <img src="assets/sample_scan.jpg" alt="3구 렌즈 필름 스캔 스트립" height="280" /> | <img src="assets/sample_wiggle.gif" alt="Wiggle 3D" height="280" /> |
+| <img src="assets/sample_scan.jpg" alt="3구 렌즈 필름 스캔 스트립" width="560" /> | <img src="assets/sample_wiggle.gif" alt="Wiggle 3D" width="190" /> |
 
 ---
 
