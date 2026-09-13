@@ -240,6 +240,37 @@ impl ImageItemContext {
     }
 }
 
+/// Progress event notification emitted during batch processing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProgressEvent<'a> {
+    /// Processing started for an image item.
+    ItemStarted {
+        /// File stem of the image item being processed.
+        file_stem: &'a str,
+        /// Current 1-based index in the batch.
+        index: usize,
+        /// Total number of items in the batch.
+        total: usize,
+    },
+    /// Processing completed for an image item.
+    ItemCompleted {
+        /// File stem of the image item processed.
+        file_stem: &'a str,
+        /// Current 1-based index in the batch.
+        index: usize,
+        /// Total number of items in the batch.
+        total: usize,
+        /// Whether processing succeeded without error.
+        success: bool,
+    },
+}
+
+/// Thread-safe observer trait for receiving pipeline execution progress.
+pub trait ProgressObserver: std::fmt::Debug + Send + Sync {
+    /// Handles an incoming pipeline progress event.
+    fn on_progress(&self, event: ProgressEvent<'_>);
+}
+
 /// A validated batch request containing verified file paths ready for processing.
 ///
 /// # Examples
@@ -251,7 +282,7 @@ impl ImageItemContext {
 /// assert!(req.debug);
 /// assert_eq!(req.device, BackendDevice::Auto);
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct BatchProcessingRequest {
     /// Verified image file paths.
     pub files: Vec<PathBuf>,
@@ -263,6 +294,8 @@ pub struct BatchProcessingRequest {
     pub device: crate::feature::BackendDevice,
     /// Configuration for Wiggle GIF generation.
     pub gif_config: crate::gif::WiggleGifConfig,
+    /// Optional observer for receiving progress notifications.
+    pub progress_observer: Option<std::sync::Arc<dyn ProgressObserver>>,
 }
 
 impl BatchProcessingRequest {
@@ -284,6 +317,7 @@ impl BatchProcessingRequest {
                 sample_factor: crate::gif::DEFAULT_NEUQUANT_SAMPLE_FAC,
                 dither: true,
             },
+            progress_observer: None,
         }
     }
 
@@ -298,6 +332,16 @@ impl BatchProcessingRequest {
     #[must_use]
     pub const fn with_gif_config(mut self, gif_config: crate::gif::WiggleGifConfig) -> Self {
         self.gif_config = gif_config;
+        self
+    }
+
+    /// Attaches a progress observer to receive batch processing execution events.
+    #[must_use]
+    pub fn with_progress_observer(
+        mut self,
+        observer: std::sync::Arc<dyn ProgressObserver>,
+    ) -> Self {
+        self.progress_observer = Some(observer);
         self
     }
 
@@ -725,14 +769,43 @@ pub fn run_batch(request: &BatchProcessingRequest) -> Result<ProcessSummary> {
     );
 
     let items = request.create_item_contexts();
+    let total = items.len();
+
     let counts = items
         .into_par_iter()
-        .map(|item| {
-            let path = item.source_path().to_path_buf();
+        .enumerate()
+        .map(|(idx, item)| {
+            let file_stem = item.file_stem().to_string();
+            if let Some(ref observer) = request.progress_observer {
+                observer.on_progress(ProgressEvent::ItemStarted {
+                    file_stem: &file_stem,
+                    index: idx + 1,
+                    total,
+                });
+            }
+
             let outcome = match process_item(item, &config) {
-                Ok(_) => ItemProcessingOutcome::Success,
+                Ok(_) => {
+                    if let Some(ref observer) = request.progress_observer {
+                        observer.on_progress(ProgressEvent::ItemCompleted {
+                            file_stem: &file_stem,
+                            index: idx + 1,
+                            total,
+                            success: true,
+                        });
+                    }
+                    ItemProcessingOutcome::Success
+                }
                 Err(err) => {
-                    tracing::error!(file = ?path, error = ?err, "Failed processing image");
+                    tracing::error!(file = %file_stem, error = ?err, "Failed processing image");
+                    if let Some(ref observer) = request.progress_observer {
+                        observer.on_progress(ProgressEvent::ItemCompleted {
+                            file_stem: &file_stem,
+                            index: idx + 1,
+                            total,
+                            success: false,
+                        });
+                    }
                     ItemProcessingOutcome::Failure
                 }
             };
@@ -798,6 +871,71 @@ mod tests {
         let summary_debug = run_batch(&request_debug).expect("Debug batch should run");
         assert_eq!(summary_debug.successful_count, 1);
         assert!(output_path.join("sample_strip_roi_overlay.png").exists());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[derive(Debug, Default)]
+    struct MockProgressObserver {
+        started: std::sync::Mutex<Vec<(String, usize, usize)>>,
+        completed: std::sync::Mutex<Vec<(String, usize, usize, bool)>>,
+    }
+
+    impl ProgressObserver for MockProgressObserver {
+        fn on_progress(&self, event: ProgressEvent<'_>) {
+            match event {
+                ProgressEvent::ItemStarted {
+                    file_stem,
+                    index,
+                    total,
+                } => {
+                    self.started
+                        .lock()
+                        .unwrap()
+                        .push((file_stem.to_string(), index, total));
+                }
+                ProgressEvent::ItemCompleted {
+                    file_stem,
+                    index,
+                    total,
+                    success,
+                } => {
+                    self.completed
+                        .lock()
+                        .unwrap()
+                        .push((file_stem.to_string(), index, total, success));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_run_batch_with_progress_observer() {
+        let temp_dir = std::env::temp_dir().join("reto_core_test_progress_observer");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let input_path = temp_dir.join("obs_strip.png");
+        let output_path = temp_dir.join("output");
+
+        let img = RgbaImage::from_pixel(300, 100, Rgba([200, 200, 200, 255]));
+        img.save(&input_path).unwrap();
+
+        let observer = std::sync::Arc::new(MockProgressObserver::default());
+        let request = BatchProcessingRequest::new(vec![input_path], output_path, false)
+            .with_progress_observer(observer.clone());
+
+        let summary = run_batch(&request).expect("Batch with observer should succeed");
+        assert_eq!(summary.total_input, 1);
+        assert_eq!(summary.successful_count, 1);
+
+        let started = observer.started.lock().unwrap().clone();
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0], ("obs_strip".to_string(), 1, 1));
+
+        let completed = observer.completed.lock().unwrap().clone();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0], ("obs_strip".to_string(), 1, 1, true));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

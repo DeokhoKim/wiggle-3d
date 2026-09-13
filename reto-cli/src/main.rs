@@ -1,18 +1,27 @@
 #![forbid(unsafe_code)]
 //! Thin CLI front-end for Reto-Split.
 //!
-//! Handles CLI argument parsing, input path discovery/verification, and passes
-//! verified file lists to `reto-core::run_batch`.
+//! Handles CLI argument parsing, input path discovery/verification, progress reporting,
+//! dual-sink logging management, and passes verified file lists to `reto-core::run_batch`.
 
 use clap::Parser;
+use indicatif::{ProgressBar, ProgressStyle};
 use reto_core::{
     clear_retinaface_model_cache, clear_superpoint_model_cache, is_supported_image, run_batch,
-    BatchProcessingRequest,
+    BatchProcessingRequest, ProgressEvent, ProgressObserver,
 };
+use std::fs::File;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use tracing_subscriber::EnvFilter;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{fmt, EnvFilter, Layer};
 
 /// Command-line arguments for reto-cli.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Parser, Debug)]
 #[command(
     author,
@@ -40,6 +49,18 @@ pub struct Cli {
     /// Disable Floyd-Steinberg dithering during GIF color quantization
     #[arg(long)]
     pub no_dither: bool,
+
+    /// Disable terminal progress bar
+    #[arg(long)]
+    pub no_progress: bool,
+
+    /// Custom file path for writing detailed execution logs
+    #[arg(long, value_name = "FILE")]
+    pub log_file: Option<PathBuf>,
+
+    /// Quiet mode (suppress all non-error output)
+    #[arg(short, long)]
+    pub quiet: bool,
 
     /// Verbose logging level (-v for debug, -vv for trace)
     #[arg(short, long, action = clap::ArgAction::Count)]
@@ -75,10 +96,67 @@ pub fn collect_verified_images(input_path: &Path) -> Vec<PathBuf> {
     }
 }
 
+/// Interactive progress observer backed by `indicatif::ProgressBar`.
+#[derive(Debug, Clone)]
+struct IndicatifObserver {
+    pb: ProgressBar,
+}
+
+impl IndicatifObserver {
+    const fn new(pb: ProgressBar) -> Self {
+        Self { pb }
+    }
+}
+
+impl ProgressObserver for IndicatifObserver {
+    fn on_progress(&self, event: ProgressEvent<'_>) {
+        match event {
+            ProgressEvent::ItemStarted { file_stem, .. } => {
+                self.pb.set_message(format!("{file_stem}.jpg"));
+            }
+            ProgressEvent::ItemCompleted { .. } => {
+                self.pb.inc(1);
+            }
+        }
+    }
+}
+
+/// Non-interactive line-based progress observer for CI/CD and piped streams.
+#[derive(Debug)]
+struct NonTtyProgressObserver {
+    completed_count: AtomicUsize,
+    last_logged_pct: AtomicUsize,
+}
+
+impl NonTtyProgressObserver {
+    const fn new() -> Self {
+        Self {
+            completed_count: AtomicUsize::new(0),
+            last_logged_pct: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl ProgressObserver for NonTtyProgressObserver {
+    fn on_progress(&self, event: ProgressEvent<'_>) {
+        if let ProgressEvent::ItemCompleted { total, .. } = event {
+            let done = self.completed_count.fetch_add(1, Ordering::SeqCst) + 1;
+            let pct = (done * 100) / total.max(1);
+            let last = self.last_logged_pct.load(Ordering::SeqCst);
+            if pct >= last + 25 || done == total {
+                self.last_logged_pct.store((pct / 25) * 25, Ordering::SeqCst);
+                tracing::info!("Progress: {}/{} ({}%) completed", done, total, pct);
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let is_tty = std::io::stderr().is_terminal() && !cli.no_progress && !cli.quiet;
 
-    let filter_directive = match cli.verbose {
+    let file_filter_directive = match cli.verbose {
         0 => {
             if cli.debug {
                 "debug,ort=info"
@@ -90,13 +168,69 @@ fn main() -> anyhow::Result<()> {
         _ => "trace,ort=info",
     };
 
-    tracing_subscriber::fmt()
-        .with_timer(tracing_subscriber::fmt::time::UtcTime::rfc_3339())
-        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
-        .with_target(true)
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter_directive)),
-        )
+    let term_filter_directive = if cli.quiet {
+        "error"
+    } else if cli.verbose > 0 || cli.debug {
+        file_filter_directive
+    } else if is_tty {
+        "warn"
+    } else {
+        file_filter_directive
+    };
+
+    let log_path = cli
+        .log_file
+        .clone()
+        .unwrap_or_else(|| cli.output.join("reto_run.log"));
+
+    let (file_layer, actual_log_file) =
+        match std::fs::create_dir_all(&cli.output).and_then(|()| File::create(&log_path)) {
+            Ok(file) => {
+                let layer = fmt::layer()
+                    .with_writer(std::sync::Mutex::new(file))
+                    .with_ansi(false)
+                    .with_timer(fmt::time::UtcTime::rfc_3339())
+                    .with_span_events(fmt::format::FmtSpan::CLOSE)
+                    .with_target(true)
+                    .with_filter(EnvFilter::new(file_filter_directive));
+                (Some(layer), Some(log_path))
+            }
+            Err(e) => {
+                eprintln!(
+                    "[WARN] Failed to initialize file logger at {}: {}",
+                    log_path.display(),
+                    e
+                );
+                (None, None)
+            }
+        };
+
+    let (indicatif_layer, tty_term_layer, non_tty_term_layer) = if is_tty {
+        let ind = tracing_indicatif::IndicatifLayer::new().with_max_progress_bars(0, None);
+        let stderr_writer = ind.get_stderr_writer();
+        let ind_layer = ind.with_filter(tracing_indicatif::filter::IndicatifFilter::new(false));
+        let term = fmt::layer()
+            .with_writer(stderr_writer)
+            .with_filter(
+                EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| EnvFilter::new(term_filter_directive)),
+            );
+        (Some(ind_layer), Some(term), None)
+    } else {
+        let term = fmt::layer()
+            .with_writer(std::io::stderr)
+            .with_filter(
+                EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| EnvFilter::new(term_filter_directive)),
+            );
+        (None, None, Some(term))
+    };
+
+    tracing_subscriber::registry()
+        .with(indicatif_layer)
+        .with(tty_term_layer)
+        .with(non_tty_term_layer)
+        .with(file_layer)
         .init();
 
     // Front-end discovery & input validation
@@ -113,17 +247,61 @@ fn main() -> anyhow::Result<()> {
     );
 
     let gif_config = reto_core::WiggleGifConfig::new(cli.gif_delay).with_dither(!cli.no_dither);
-    let request = BatchProcessingRequest::new(files, cli.output.clone(), cli.debug)
+    let mut request = BatchProcessingRequest::new(files.clone(), cli.output.clone(), cli.debug)
         .with_gif_config(gif_config);
-    let summary = run_batch(&request)?;
 
-    println!(
-        "[OK] Processed {} images ({} succeeded, {} failed). Output directory: {}",
-        summary.total_input,
-        summary.successful_count,
-        summary.failed_count,
-        cli.output.display()
-    );
+    let progress_bar = if is_tty {
+        let pb = ProgressBar::new(files.len() as u64);
+        pb.set_draw_target(indicatif::ProgressDrawTarget::stderr_with_hz(20));
+        let style = ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:24.cyan/blue}] {pos}/{len} ({percent}%) ETA: {eta} | {wide_msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_bar())
+            .progress_chars("━╸─")
+            .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏");
+        pb.set_style(style);
+        pb.enable_steady_tick(std::time::Duration::from_millis(120));
+        let observer = Arc::new(IndicatifObserver::new(pb.clone()));
+        request = request.with_progress_observer(observer);
+        Some(pb)
+    } else if !cli.quiet && !cli.no_progress {
+        let observer = Arc::new(NonTtyProgressObserver::new());
+        request = request.with_progress_observer(observer);
+        None
+    } else {
+        None
+    };
+
+    let start_time = Instant::now();
+    let summary = run_batch(&request)?;
+    let elapsed = start_time.elapsed();
+
+    if let Some(pb) = progress_bar {
+        pb.finish_and_clear();
+    }
+
+    if !cli.quiet {
+        if is_tty {
+            println!(
+                "✔ [OK] Processed {} images ({} succeeded, {} failed) in {:.1}s.",
+                summary.total_input,
+                summary.successful_count,
+                summary.failed_count,
+                elapsed.as_secs_f64()
+            );
+        } else {
+            println!(
+                "[OK] Processed {} images ({} succeeded, {} failed) in {:.1}s.",
+                summary.total_input,
+                summary.successful_count,
+                summary.failed_count,
+                elapsed.as_secs_f64()
+            );
+        }
+        println!("  • Output Directory: {}", cli.output.display());
+        if let Some(ref log_file) = actual_log_file {
+            println!("  • Execution Log:    {}", log_file.display());
+        }
+    }
 
     if summary.failed_count > 0 {
         tracing::warn!(
@@ -138,4 +316,43 @@ fn main() -> anyhow::Result<()> {
     clear_retinaface_model_cache();
 
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cli_parsing_options() {
+        let args = vec![
+            "reto-cli",
+            "-i",
+            "scans/",
+            "-o",
+            "output/",
+            "--no-progress",
+            "--quiet",
+            "--log-file",
+            "custom.log",
+        ];
+        let cli = Cli::try_parse_from(args).expect("Should parse valid arguments");
+        assert_eq!(cli.input, PathBuf::from("scans/"));
+        assert_eq!(cli.output, PathBuf::from("output/"));
+        assert!(cli.no_progress);
+        assert!(cli.quiet);
+        assert_eq!(cli.log_file, Some(PathBuf::from("custom.log")));
+    }
+
+    #[test]
+    fn test_collect_verified_images_empty_dir() {
+        let temp_dir = std::env::temp_dir().join("reto_cli_test_collect");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let files = collect_verified_images(&temp_dir);
+        assert!(files.is_empty());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }

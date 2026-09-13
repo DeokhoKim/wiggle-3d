@@ -63,7 +63,8 @@ pub use partition::{
 };
 pub use pipeline::{
     is_supported_image, process_item, process_single_image, run_batch, BatchProcessingRequest,
-    ImageItemContext, ItemProcessingOutcome, ProcessSummary, SUPPORTED_EXTENSIONS,
+    ImageItemContext, ItemProcessingOutcome, ProcessSummary, ProgressEvent, ProgressObserver,
+    SUPPORTED_EXTENSIONS,
 };
 pub use stats::{
     matched_filter_1d, AxisPixelStats, AxisStatisticsProfile, GutterSpan, OptimalGridResult,
