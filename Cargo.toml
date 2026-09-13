@@ -7,10 +7,10 @@ resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
-authors = ["Reto-Split Developers"]
+authors = ["Wiggle-3D Developers"]
 edition = "2021"
 license = "MIT"
-description = "A 3D film camera image splitting and alignment tool"
+description = "A 3D multi-lens film camera image splitting and alignment tool"
 
 [workspace.dependencies]
 thiserror = "2.0"
@@ -23,7 +23,7 @@ image = "0.25"
 rayon = "1.10"
 num-traits = "0.2"
 ndarray = "0.17"
-ort = { version = "2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "load-dynamic", "cuda"] }
+ort = { version = "2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "copy-dylibs", "cuda"] }
 ureq = "2.10"
 kstring = "=2.0.2"
 sha2 = "0.10"
@@ -53,4 +53,3 @@ lto = "thin"
 codegen-units = 1
 panic = "abort"
 strip = true
-
