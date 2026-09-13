@@ -28,6 +28,8 @@ ureq = "2.10"
 kstring = "=2.0.2"
 sha2 = "0.10"
 color_quant = "1.1"
+indicatif = "0.17"
+tracing-indicatif = "0.3"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
