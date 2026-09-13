@@ -148,7 +148,10 @@ impl ProgressObserver for NonTtyProgressObserver {
             let pct = (done * 100) / total.max(1);
             let last = self.last_logged_pct.load(Ordering::Relaxed);
             if pct >= last + PROGRESS_STEP_PCT || done == total {
-                self.last_logged_pct.store((pct / PROGRESS_STEP_PCT) * PROGRESS_STEP_PCT, Ordering::Relaxed);
+                self.last_logged_pct.store(
+                    (pct / PROGRESS_STEP_PCT) * PROGRESS_STEP_PCT,
+                    Ordering::Relaxed,
+                );
                 tracing::info!("Progress: {}/{} ({}%) completed", done, total, pct);
             }
         }
@@ -213,20 +216,16 @@ fn main() -> anyhow::Result<()> {
         let ind = tracing_indicatif::IndicatifLayer::new().with_max_progress_bars(0, None);
         let stderr_writer = ind.get_stderr_writer();
         let ind_layer = ind.with_filter(tracing_indicatif::filter::IndicatifFilter::new(false));
-        let term = fmt::layer()
-            .with_writer(stderr_writer)
-            .with_filter(
-                EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| EnvFilter::new(term_filter_directive)),
-            );
+        let term = fmt::layer().with_writer(stderr_writer).with_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new(term_filter_directive)),
+        );
         (Some(ind_layer), Some(term), None)
     } else {
-        let term = fmt::layer()
-            .with_writer(std::io::stderr)
-            .with_filter(
-                EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| EnvFilter::new(term_filter_directive)),
-            );
+        let term = fmt::layer().with_writer(std::io::stderr).with_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new(term_filter_directive)),
+        );
         (None, None, Some(term))
     };
 

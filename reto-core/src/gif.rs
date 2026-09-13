@@ -956,7 +956,8 @@ impl WiggleAligner {
             let local_src_x = (min_x - dx).max(0) as u32;
             let local_src_y = (min_y - dy).max(0) as u32;
 
-            let crop = image::imageops::crop_imm(frame, local_src_x, local_src_y, crop_w, crop_h).to_image();
+            let crop = image::imageops::crop_imm(frame, local_src_x, local_src_y, crop_w, crop_h)
+                .to_image();
             aligned_crops.push(crop);
         }
 

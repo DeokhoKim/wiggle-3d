@@ -92,8 +92,7 @@ impl AxisPixelStats {
 
         // 5th percentile rank and 98th percentile rank
         let p5_target = ((n * DEFAULT_LOW_PERCENTILE).round() as u32).min(total_count - 1);
-        let p98_target =
-            ((n * DEFAULT_HIGH_PERCENTILE).round() as u32).min(total_count - 1);
+        let p98_target = ((n * DEFAULT_HIGH_PERCENTILE).round() as u32).min(total_count - 1);
 
         let mut cum = 0_u32;
         let mut p5 = min_val;
