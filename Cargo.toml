@@ -1,0 +1,55 @@
+[workspace]
+members = [
+    "reto-core",
+    "reto-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+authors = ["Wiggle-3D Developers"]
+edition = "2021"
+license = "MIT"
+description = "A 3D multi-lens film camera image splitting and alignment tool"
+
+[workspace.dependencies]
+thiserror = "2.0"
+anyhow = "1.0"
+tracing = { version = "0.1", features = ["attributes"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "time"] }
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+image = "0.25"
+rayon = "1.10"
+num-traits = "0.2"
+ndarray = "0.17"
+ort = { version = "2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "copy-dylibs", "cuda"] }
+ureq = "2.10"
+kstring = "=2.0.2"
+sha2 = "0.10"
+color_quant = "1.1"
+indicatif = "0.17"
+tracing-indicatif = "0.3"
+crossbeam-channel = "0.5"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+todo = "warn"
+panic = "warn"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
