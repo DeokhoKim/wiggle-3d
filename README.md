@@ -21,9 +21,13 @@ To produce a natural stereoscopic "wiggle" animation:
 
 ## Sample
 
-| Raw 3-Lens Film Strip Scan | Synchronized Wiggle 3D Loop |
-| :---: | :---: |
-| <img src="assets/sample_scan.jpg" alt="Raw 3-Lens Film Strip Scan" height="280" /> | <img src="assets/sample_wiggle.gif" alt="Synchronized Wiggle 3D Loop" height="280" /> |
+A raw 3-lens film scan (*left*) automatically partitioned, stabilized with sub-pixel focal locking, and synthesized into a smooth stereoscopic Wiggle 3D loop (*right*):
+
+<p align="center">
+  <img src="assets/sample_scan.jpg" alt="Raw 3-Lens Film Strip Scan" width="560" />
+  &nbsp;&nbsp;
+  <img src="assets/sample_wiggle.gif" alt="Wiggle 3D Animation" width="179" />
+</p>
 
 ---
 
