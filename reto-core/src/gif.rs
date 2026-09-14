@@ -559,7 +559,7 @@ impl WiggleAligner {
                 // Combined average disparity magnitude across baselines 0-1 and 2-1
                 let mag_01 = (dx_01 * dx_01 + dy_01 * dy_01).sqrt();
                 let mag_21 = (dx_21 * dx_21 + dy_21 * dy_21).sqrt();
-                let disp_mag = (mag_01 + mag_21) * 0.5;
+                let disp_mag = f32::midpoint(mag_01, mag_21);
 
                 // Exclude 0 or near-zero disparity values to avoid infinite / undefined depth values (1/d)
                 if disp_mag > MIN_DISPARITY_FOR_DEPTH_PX {

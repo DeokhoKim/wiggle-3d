@@ -67,7 +67,7 @@ pub trait LumaConverter: Send + Sync {
             return;
         }
         let [wr, wg, wb] = self.weights();
-        for (out, chunk) in out_luma[..count].iter_mut().zip(rgb.chunks_exact(3)) {
+        for (out, chunk) in out_luma[..count].iter_mut().zip(rgb.as_chunks::<3>().0) {
             let r = f32::from(chunk[0]);
             let g = f32::from(chunk[1]);
             let b = f32::from(chunk[2]);
@@ -91,7 +91,7 @@ pub trait LumaConverter: Send + Sync {
             return;
         }
         let [wr, wg, wb] = self.weights();
-        for (out, chunk) in out_luma[..count].iter_mut().zip(rgba.chunks_exact(4)) {
+        for (out, chunk) in out_luma[..count].iter_mut().zip(rgba.as_chunks::<4>().0) {
             let r = f32::from(chunk[0]);
             let g = f32::from(chunk[1]);
             let b = f32::from(chunk[2]);

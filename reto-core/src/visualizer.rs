@@ -536,7 +536,7 @@ impl RoiVisualizer {
         // using the 3-frame average disparity magnitude matching gif.rs depth clustering.
         let max_disparity = triplets
             .iter()
-            .map(|t| (t.disparity_01 + t.disparity_12) * 0.5)
+            .map(|t| f32::midpoint(t.disparity_01, t.disparity_12))
             .fold(0.0_f32, f32::max)
             .max(10.0_f32);
 
@@ -556,7 +556,7 @@ impl RoiVisualizer {
                     // Far background (small disparity) -> Deep Blue / Cyan
                     // Midground -> Emerald Green / Yellow
                     // Close foreground (high disparity) -> Orange / Vivid Crimson Red
-                    let avg_disp = (trip.disparity_01 + trip.disparity_12) * 0.5;
+                    let avg_disp = f32::midpoint(trip.disparity_01, trip.disparity_12);
                     let t = (avg_disp / max_disparity).clamp(0.0, 1.0);
                     let color = disparity_to_heatmap_rgba(t);
 
