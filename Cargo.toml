@@ -46,6 +46,9 @@ unwrap_used = "warn"
 expect_used = "warn"
 todo = "warn"
 panic = "warn"
+result_large_err = "allow"
+chunks_exact_to_as_chunks = "allow"
+manual_midpoint = "allow"
 
 [profile.release]
 opt-level = 3
