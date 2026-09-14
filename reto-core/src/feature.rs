@@ -452,20 +452,22 @@ pub fn ensure_model_cached(
         .timeout_read(std::time::Duration::from_secs(10))
         .redirects(5)
         .build();
-    let resp = agent
-        .get(url)
-        .call()
-        .or_else(|e| {
+    let resp = match agent.get(url).call() {
+        Ok(resp) => resp,
+        Err(e) => {
             tracing::warn!(
                 primary_error = %e,
                 fallback_url = %FALLBACK_SUPERPOINT_MODEL_URL,
                 "Primary SuperPoint download failed; attempting fallback mirror"
             );
-            agent.get(FALLBACK_SUPERPOINT_MODEL_URL).call()
-        })
-        .map_err(|e| {
-            AlignmentError::ModelLoad(format!("Failed to download model from {url}: {e}"))
-        })?;
+            agent
+                .get(FALLBACK_SUPERPOINT_MODEL_URL)
+                .call()
+                .map_err(|e| {
+                    AlignmentError::ModelLoad(format!("Failed to download model from {url}: {e}"))
+                })?
+        }
+    };
 
     let mut reader = resp.into_reader();
     let temp_path = model_path.with_extension("tmp");
@@ -1112,7 +1114,7 @@ fn compute_dot_product_256(a: &[f32], b: &[f32]) -> f32 {
     let mut acc2 = 0.0_f32;
     let mut acc3 = 0.0_f32;
 
-    for (chunk_a, chunk_b) in a.chunks_exact(16).zip(b.chunks_exact(16)) {
+    for (chunk_a, chunk_b) in a.as_chunks::<16>().0.iter().zip(b.as_chunks::<16>().0) {
         acc0 = chunk_a[0].mul_add(
             chunk_b[0],
             chunk_a[1].mul_add(
